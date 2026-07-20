@@ -21,6 +21,8 @@ const state = {
   sidebarVisible: true,
   editingSessionID: null,
   editingAccountID: null,
+  accountConfigAccountID: null,
+  accountConfigPath: null,
   tabs: [],
   panes: { primary: null, secondary: null },
   focusedPane: 'primary',
@@ -40,6 +42,7 @@ const settingsDialog = $('#settingsDialog');
 const transcriptDialog = $('#transcriptDialog');
 const accountsDialog = $('#accountsDialog');
 const accountDialog = $('#accountDialog');
+const accountConfigDialog = $('#accountConfigDialog');
 const codexLoginDialog = $('#codexLoginDialog');
 const claudeLoginDialog = $('#claudeLoginDialog');
 const accountAuth = globalThis.VibeDockAccountAuth;
@@ -218,6 +221,115 @@ function collectDirectConfig(prefix, agent) {
     secret: $(`#${prefix}DirectSecret`).value.trim(),
     clear_secret: Boolean($(`#${prefix}DirectClearSecret`)?.checked),
   };
+}
+
+function launchProfileDefaults(agent, profile = {}) {
+  return {
+    version: 1,
+    model: profile.model || '',
+    codex_approval: agent === 'codex' ? (profile.codex_approval || '') : '',
+    codex_sandbox: agent === 'codex' ? (profile.codex_sandbox || '') : '',
+    codex_web_search: agent === 'codex' && Boolean(profile.codex_web_search),
+    codex_config_overrides: agent === 'codex' ? (profile.codex_config_overrides || []) : [],
+    claude_continue: agent === 'claude' && Boolean(profile.claude_continue),
+    opencode_continue: agent === 'opencode' && Boolean(profile.opencode_continue),
+    extra_args: profile.extra_args || [],
+    config_mode: isDirectAgent(agent) ? (profile.config_mode || 'managed') : '',
+    custom_config: isDirectAgent(agent) ? (profile.custom_config || '') : '',
+  };
+}
+
+function applyLaunchProfile(agent, profile = null) {
+  const value = launchProfileDefaults(agent, profile || {});
+  $('#sessionLaunchModel').value = value.model;
+  $('#sessionCodexApproval').value = value.codex_approval;
+  $('#sessionCodexSandbox').value = value.codex_sandbox;
+  $('#sessionCodexWebSearch').checked = value.codex_web_search;
+  $('#sessionClaudeContinue').checked = value.claude_continue;
+  $('#sessionOpenCodeContinue').checked = value.opencode_continue;
+  $('#sessionCodexOverrides').value = value.codex_config_overrides.join('\n');
+  $('#sessionExtraArgs').value = value.extra_args.join('\n');
+  $('#sessionConfigMode').value = value.config_mode || 'managed';
+  $('#sessionConfigMode').dataset.previous = value.config_mode || 'managed';
+  $('#sessionCustomConfig').value = value.custom_config;
+  updateLaunchProfileFields(agent);
+}
+
+function updateLaunchProfileFields(agent) {
+  const isCodex = agent === 'codex';
+  const isClaude = agent === 'claude';
+  const isOpenCode = agent === 'opencode';
+  $('#sessionCodexApprovalRow').classList.toggle('hidden', !isCodex);
+  $('#sessionCodexSandboxRow').classList.toggle('hidden', !isCodex);
+  $('#sessionCodexSearchRow').classList.toggle('hidden', !isCodex);
+  $('#sessionCodexOverridesRow').classList.toggle('hidden', !isCodex);
+  $('#sessionClaudeContinueRow').classList.toggle('hidden', !isClaude);
+  $('#sessionOpenCodeContinueRow').classList.toggle('hidden', !isOpenCode);
+  $('#sessionAgentConfigFields').classList.toggle('hidden', !isDirectAgent(agent));
+  if (isDirectAgent(agent)) {
+    const path = agent === 'pi' ? 'models.json' : 'opencode.json';
+    $('#sessionConfigPath').textContent = path;
+    const custom = $('#sessionConfigMode').value === 'custom';
+    $('#sessionCustomConfig').readOnly = !custom;
+    $('#sessionCustomConfig').classList.toggle('readonly', !custom);
+  }
+}
+
+function collectLaunchProfile(agent) {
+  const profile = {
+    version: 1,
+    model: $('#sessionLaunchModel').value.trim(),
+    codex_approval: agent === 'codex' ? $('#sessionCodexApproval').value : '',
+    codex_sandbox: agent === 'codex' ? $('#sessionCodexSandbox').value : '',
+    codex_web_search: agent === 'codex' && $('#sessionCodexWebSearch').checked,
+    codex_config_overrides: agent === 'codex' ? $('#sessionCodexOverrides').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean) : [],
+    claude_continue: agent === 'claude' && $('#sessionClaudeContinue').checked,
+    opencode_continue: agent === 'opencode' && $('#sessionOpenCodeContinue').checked,
+    extra_args: $('#sessionExtraArgs').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean),
+    config_mode: isDirectAgent(agent) ? $('#sessionConfigMode').value : '',
+    custom_config: isDirectAgent(agent) && $('#sessionConfigMode').value === 'custom' ? $('#sessionCustomConfig').value : '',
+  };
+  return profile;
+}
+
+let launchPreviewTimer = 0;
+async function refreshLaunchPreview() {
+  const agent = $('#sessionAgentInput').value;
+  const preview = $('#sessionLaunchPreview');
+  if (!preview) return;
+  preview.textContent = '正在生成…';
+  try {
+    const directConfig = collectDirectConfig('session', agent) || {};
+    if (directConfig.secret) directConfig.secret = '';
+    directConfig.clear_secret = false;
+    const result = await api('/api/launch-preview', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        agent,
+        account_id: isDirectAgent(agent) ? '' : $('#sessionAccountInput').value,
+        session_id: state.editingSessionID || '',
+        permission_mode: agent === 'claude' ? $('#sessionPermissionMode').value : 'manual',
+        dangerous_skip_permissions: agent === 'claude' && $('#sessionDangerousSkip').checked,
+        direct_config: directConfig,
+        launch_profile: collectLaunchProfile(agent),
+      }), timeout: 15000,
+    });
+    preview.textContent = result.command?.preview || `${result.command?.executable || ''} ${(result.command?.arguments || []).join(' ')}`;
+    const warnings = result.command?.warnings || [];
+    const warningsBox = $('#sessionLaunchWarnings');
+    warningsBox.classList.toggle('hidden', !warnings.length);
+    warningsBox.textContent = warnings.join('；');
+    if (result.config?.managed_template && isDirectAgent(agent) && $('#sessionConfigMode').value === 'managed') {
+      $('#sessionCustomConfig').value = result.config.managed_template;
+    }
+  } catch (error) {
+    preview.textContent = `无法生成预览：${error.message}`;
+  }
+}
+
+function scheduleLaunchPreview() {
+  clearTimeout(launchPreviewTimer);
+  launchPreviewTimer = setTimeout(() => void refreshLaunchPreview(), 180);
 }
 
 /* Dashboard */
@@ -927,7 +1039,9 @@ function openSessionDialog(sessionID = null, presetAgent = null) {
   } else if (presetAgent) $('#sessionAgentInput').value = presetAgent;
   renderAccountOptions($('#sessionAgentInput').value, $('#sessionAccountInput'), session?.account_id || '');
   updateDirectFields('session', $('#sessionAgentInput').value, session || null);
+  applyLaunchProfile($('#sessionAgentInput').value, session?.launch_profile || null);
   sessionDialog.showModal();
+  void refreshLaunchPreview();
 }
 
 async function saveSession(event) {
@@ -936,7 +1050,7 @@ async function saveSession(event) {
   const button = $('#saveSessionButton');
   const errorBox = $('#sessionError');
   const agent = $('#sessionAgentInput').value;
-  const payload = {name:$('#sessionNameInput').value.trim(), agent, account_id:isDirectAgent(agent) ? '' : $('#sessionAccountInput').value, permission_mode:agent === 'claude' ? $('#sessionPermissionMode').value : 'manual', dangerous_skip_permissions:agent === 'claude' && $('#sessionDangerousSkip').checked, dangerous_confirmation:agent === 'claude' ? $('#sessionDangerousConfirmation').value.trim() : '', direct_config:collectDirectConfig('session', agent)};
+  const payload = {name:$('#sessionNameInput').value.trim(), agent, account_id:isDirectAgent(agent) ? '' : $('#sessionAccountInput').value, permission_mode:agent === 'claude' ? $('#sessionPermissionMode').value : 'manual', dangerous_skip_permissions:agent === 'claude' && $('#sessionDangerousSkip').checked, dangerous_confirmation:agent === 'claude' ? $('#sessionDangerousConfirmation').value.trim() : '', direct_config:collectDirectConfig('session', agent), launch_profile:collectLaunchProfile(agent)};
   button.disabled = true;
   errorBox.classList.add('hidden');
   try {
@@ -1052,10 +1166,80 @@ function renderAccounts() {
     return `<article class="account-card ${nativeLogin ? 'native-login-card' : ''}" data-account-card="${escapeHTML(account.id)}">
       <div class="account-card-head"><span class="session-agent ${escapeHTML(account.agent)}">${escapeHTML(agentGlyph(account.agent))}</span><div><h4>${escapeHTML(account.name)}</h4><small>${escapeHTML(agentLabel(account.agent))} · ${escapeHTML(authTypeLabel(account.auth_type))}</small></div>${nativeLogin ? `<span class="native-auth-badge ${escapeHTML(status.tone)}">${escapeHTML(status.label)}</span>` : `<span class="account-usage">${references} sessions</span>`}</div>
       <div class="account-details"><div><span>Endpoint</span><b>${escapeHTML(accountEndpoint(account))}</b></div><div><span>Model</span><b>${escapeHTML(account.model || 'provider 默认')}</b></div><div><span>Credential</span><b>${secretState}</b></div>${nativeLogin ? `<div><span>官方登录状态</span><b>${escapeHTML(record.message || status.label)}</b></div>` : `<div><span>Last used</span><b>${escapeHTML(formatDate(account.last_used_at))}</b></div>`}</div>
-      <div class="account-card-actions">${nativeLogin ? nativeAuthActionMarkup(account, record) : `<button class="button ghost" data-account-action="probe" data-id="${escapeHTML(account.id)}">测试</button>`}<button class="button ghost" data-account-action="edit" data-id="${escapeHTML(account.id)}">编辑</button><button class="button danger" data-account-action="delete" data-id="${escapeHTML(account.id)}">删除</button></div>
+      <div class="account-card-actions">${nativeLogin ? nativeAuthActionMarkup(account, record) : `<button class="button ghost" data-account-action="probe" data-id="${escapeHTML(account.id)}">测试</button>`}<button class="button ghost" data-account-action="config" data-id="${escapeHTML(account.id)}">配置文件</button><button class="button ghost" data-account-action="edit" data-id="${escapeHTML(account.id)}">编辑</button><button class="button danger" data-account-action="delete" data-id="${escapeHTML(account.id)}">删除</button></div>
     </article>`;
   }).join('');
   updateControlAuthWarnings();
+}
+
+async function loadAccountConfigFile(path = state.accountConfigPath) {
+  const accountID = state.accountConfigAccountID;
+  if (!accountID || !path) return;
+  state.accountConfigPath = path;
+  $('#accountConfigPath').textContent = path;
+  $('#accountConfigState').textContent = '读取中…';
+  $('#accountConfigError').classList.add('hidden');
+  try {
+    const document = await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`);
+    $('#accountConfigContent').value = document.content || '';
+    $('#accountConfigState').textContent = document.exists ? '已存在 · 可编辑' : '文件尚未创建';
+  } catch (error) {
+    $('#accountConfigState').textContent = '读取失败';
+    $('#accountConfigError').textContent = error.message;
+    $('#accountConfigError').classList.remove('hidden');
+  }
+}
+
+async function openAccountConfig(accountID) {
+  const account = accountFor(accountID);
+  if (!account) return;
+  state.accountConfigAccountID = accountID;
+  state.accountConfigPath = null;
+  $('#accountConfigTitle').textContent = `${account.name} · 配置文件`;
+  $('#accountConfigContent').value = '';
+  $('#accountConfigError').classList.add('hidden');
+  accountConfigDialog.showModal();
+  try {
+    const result = await api(`/api/accounts/${accountID}/config`);
+    const tree = $('#accountConfigTree');
+    tree.innerHTML = (result.files || []).map(file => `<button type="button" data-config-path="${escapeHTML(file.path)}"><span>${escapeHTML(file.path)}</span><small>${file.exists ? `${file.size || 0} bytes` : '未创建'}</small></button>`).join('');
+    const first = result.files?.[0]?.path;
+    if (first) {
+      tree.querySelector(`[data-config-path="${CSS.escape(first)}"]`)?.classList.add('selected');
+      await loadAccountConfigFile(first);
+    }
+  } catch (error) {
+    $('#accountConfigError').textContent = error.message;
+    $('#accountConfigError').classList.remove('hidden');
+  }
+}
+
+async function saveAccountConfig() {
+  const accountID = state.accountConfigAccountID;
+  const path = state.accountConfigPath;
+  if (!accountID || !path) return;
+  try {
+    await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`, {method:'PUT', headers:{'Content-Type':'application/json', [AUTH_REQUEST_HEADER]:'account-auth'}, body:JSON.stringify({content:$('#accountConfigContent').value})});
+    $('#accountConfigState').textContent = '已保存';
+    showToast('账号配置文件已保存');
+  } catch (error) {
+    $('#accountConfigError').textContent = error.message;
+    $('#accountConfigError').classList.remove('hidden');
+  }
+}
+
+async function resetAccountConfig() {
+  const accountID = state.accountConfigAccountID;
+  const path = state.accountConfigPath;
+  if (!accountID || !path || !confirm(`确定重置 ${path}？这会移除当前文件。`)) return;
+  try {
+    await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`, {method:'DELETE', headers:{[AUTH_REQUEST_HEADER]:'account-auth'}});
+    await loadAccountConfigFile(path);
+    showToast('账号配置文件已重置');
+  } catch (error) {
+    $('#accountConfigError').textContent = error.message;
+    $('#accountConfigError').classList.remove('hidden');
+  }
 }
 async function refreshNativeAuthStatuses() {
   const accounts = state.accounts.filter(nativeLoginAccount);
@@ -1493,9 +1677,12 @@ $('#uploadForm').addEventListener('submit', async event => {
   }
 });
 $('#previewForm').addEventListener('submit', event => { event.preventDefault(); const port = Number($('#previewPortInput').value); if (!Number.isInteger(port) || port < 1 || port > 65535) return; previewDialog.close(); openTab('port', port); });
-$('#sessionDangerousSkip').onchange = () => $('#sessionDangerousConfirmRow').classList.toggle('hidden', !$('#sessionDangerousSkip').checked);
+$('#sessionDangerousSkip').onchange = () => { $('#sessionDangerousConfirmRow').classList.toggle('hidden', !$('#sessionDangerousSkip').checked); scheduleLaunchPreview(); };
 $('#sessionForm').addEventListener('submit', saveSession);
 $('#accountForm').addEventListener('submit', saveAccount);
+$('#saveAccountConfig').onclick = () => void saveAccountConfig();
+$('#reloadAccountConfig').onclick = () => void loadAccountConfigFile();
+$('#resetAccountConfig').onclick = () => void resetAccountConfig();
 
 /* Event wiring */
 const openCreateButton = $('#openCreate');
@@ -1557,8 +1744,24 @@ $('#sessionAddAccountButton').onclick = () => openAccountEditor(null, {returnTo:
 $('#accountAgentInput').onchange = () => populateAuthOptions($('#accountAgentInput').value, $('#accountAuthInput').value);
 $('#accountAuthInput').onchange = () => selectAuthMethod($('#accountAuthInput').value);
 $('#createAgentInput').onchange = () => { const agent = $('#createAgentInput').value; renderAccountOptions(agent, $('#createAccountInput')); updateDirectFields('create', agent); };
-$('#sessionAgentInput').onchange = () => { const agent = $('#sessionAgentInput').value; renderAccountOptions(agent, $('#sessionAccountInput')); updateDirectFields('session', agent); };
-$('#sessionAccountInput').onchange = () => renderSessionLoginGuide($('#sessionAgentInput').value, $('#sessionAccountInput').value);
+$('#sessionAgentInput').onchange = () => { const agent = $('#sessionAgentInput').value; renderAccountOptions(agent, $('#sessionAccountInput')); updateDirectFields('session', agent); applyLaunchProfile(agent); scheduleLaunchPreview(); };
+$('#sessionAccountInput').onchange = () => { renderSessionLoginGuide($('#sessionAgentInput').value, $('#sessionAccountInput').value); scheduleLaunchPreview(); };
+$('#sessionConfigMode').onchange = event => {
+  const previous = event.currentTarget.dataset.previous || 'managed';
+  if (previous === 'custom' && event.currentTarget.value === 'managed' && !confirm('切换到 Managed 后，下次启动会用表单重新生成配置文件。确定继续？')) {
+    event.currentTarget.value = 'custom';
+    return;
+  }
+  event.currentTarget.dataset.previous = event.currentTarget.value;
+  updateLaunchProfileFields($('#sessionAgentInput').value);
+  scheduleLaunchPreview();
+};
+$('#refreshLaunchPreview').onclick = () => void refreshLaunchPreview();
+for (const id of ['sessionPermissionMode','sessionDirectProvider','sessionDirectModel','sessionDirectBaseURL','sessionDirectProtocol','sessionDirectThinking','sessionDirectAutoApprove','sessionLaunchModel','sessionCodexApproval','sessionCodexSandbox','sessionCodexWebSearch','sessionClaudeContinue','sessionOpenCodeContinue','sessionCodexOverrides','sessionExtraArgs','sessionCustomConfig']) {
+  const element = $(`#${id}`);
+  if (!element) continue;
+  element.addEventListener(element.matches('select,input[type="checkbox"]') ? 'change' : 'input', scheduleLaunchPreview);
+}
 
 $$('[data-create]').forEach(button => button.onclick = () => openCreate());
 $('#emptyStateAction').onclick = event => {
@@ -1647,6 +1850,7 @@ $('#accountList').addEventListener('click', event => {
   const action = event.target.closest('[data-account-action]');
   if (!action) return;
   const account = accountFor(action.dataset.id);
+  if (action.dataset.accountAction === 'config') void openAccountConfig(action.dataset.id);
   if (action.dataset.accountAction === 'edit') openAccountEditor(action.dataset.id);
   if (action.dataset.accountAction === 'probe') probeAccount(action.dataset.id);
   if (action.dataset.accountAction === 'delete') deleteAccount(action.dataset.id);
@@ -1654,6 +1858,12 @@ $('#accountList').addEventListener('click', event => {
   if (action.dataset.accountAction === 'continue-login' && account) continueOrStartLogin(account);
   if (action.dataset.accountAction === 'cancel-login') cancelAccountLogin(action.dataset.id);
   if (action.dataset.accountAction === 'logout') logoutAccount(action.dataset.id);
+});
+$('#accountConfigTree').addEventListener('click', event => {
+  const button = event.target.closest('[data-config-path]');
+  if (!button) return;
+  $$('.config-tree button').forEach(item => item.classList.toggle('selected', item === button));
+  void loadAccountConfigFile(button.dataset.configPath);
 });
 
 let resizingSplit = false;

@@ -333,39 +333,45 @@ func (s *Server) runtimeSession(ws model.Workspace, session model.Session) (mode
 			return model.SessionRuntimeRequest{}, err
 		}
 		req.Direct = direct
-		return req, nil
-	}
-	if session.AccountID == "" || session.Agent == "shell" {
-		return req, nil
-	}
-	account, ok := s.store.GetAccount(session.AccountID)
-	if !ok {
-		return model.SessionRuntimeRequest{}, errors.New("Session 绑定的账号已不存在")
-	}
-	if s.auth != nil {
-		if attempt := s.auth.current(account.ID); attempt != nil && !attempt.State.Terminal() {
-			return model.SessionRuntimeRequest{}, errors.New("账号正在完成官方登录，请完成或取消登录后再启动 Session")
+	} else if session.AccountID != "" && session.Agent != "shell" {
+		account, ok := s.store.GetAccount(session.AccountID)
+		if !ok {
+			return model.SessionRuntimeRequest{}, errors.New("Session 绑定的账号已不存在")
+		}
+		if s.auth != nil {
+			if attempt := s.auth.current(account.ID); attempt != nil && !attempt.State.Terminal() {
+				return model.SessionRuntimeRequest{}, errors.New("账号正在完成官方登录，请完成或取消登录后再启动 Session")
+			}
+		}
+		if account.Agent != session.Agent {
+			return model.SessionRuntimeRequest{}, errors.New("Session 与账号的 Agent 类型不匹配")
+		}
+		secret, err := s.keyring.Decrypt(account.SecretCiphertext)
+		if err != nil {
+			return model.SessionRuntimeRequest{}, err
+		}
+		if account.AuthType != "login" && secret == "" {
+			return model.SessionRuntimeRequest{}, errors.New("账号凭据为空")
+		}
+		req.Account = model.AccountRuntime{
+			ID: account.ID, Name: account.Name, Agent: account.Agent, AuthType: account.AuthType,
+			BaseURL: account.BaseURL, Model: account.Model, Secret: secret, ExtraEnv: account.ExtraEnv,
+		}
+		now := time.Now().UTC()
+		if account.LastUsedAt == nil || now.Sub(*account.LastUsedAt) > 5*time.Minute {
+			account.LastUsedAt = &now
+			account.UpdatedAt = now
+			_ = s.store.PutAccount(account)
 		}
 	}
-	if account.Agent != session.Agent {
-		return model.SessionRuntimeRequest{}, errors.New("Session 与账号的 Agent 类型不匹配")
-	}
-	secret, err := s.keyring.Decrypt(account.SecretCiphertext)
+	command, err := compileLaunchCommand(session.Agent, session.LaunchProfile, req.Account, req.Direct, session.ID, session.PermissionMode, session.DangerousSkipPermissions)
 	if err != nil {
 		return model.SessionRuntimeRequest{}, err
 	}
-	if account.AuthType != "login" && secret == "" {
-		return model.SessionRuntimeRequest{}, errors.New("账号凭据为空")
-	}
-	req.Account = model.AccountRuntime{
-		ID: account.ID, Name: account.Name, Agent: account.Agent, AuthType: account.AuthType,
-		BaseURL: account.BaseURL, Model: account.Model, Secret: secret, ExtraEnv: account.ExtraEnv,
-	}
-	now := time.Now().UTC()
-	if account.LastUsedAt == nil || now.Sub(*account.LastUsedAt) > 5*time.Minute {
-		account.LastUsedAt = &now
-		account.UpdatedAt = now
-		_ = s.store.PutAccount(account)
+	req.LaunchCommand = command
+	if session.LaunchProfile != nil && (session.Agent == "pi" || session.Agent == "opencode") {
+		req.ConfigMode = session.LaunchProfile.ConfigMode
+		req.CustomConfig = session.LaunchProfile.CustomConfig
 	}
 	return req, nil
 }

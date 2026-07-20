@@ -75,6 +75,30 @@ class ValidationTest(RootCase):
             (self.root / "account12345").unlink()
             outside.rmdir()
 
+    def test_config_files_are_allowlisted_and_validated(self):
+        listed = helper.list_config(self.root, ACCOUNT, "codex")
+        self.assertEqual([item["path"] for item in listed["files"]], ["config.toml"])
+        saved = helper._write_config(self.root, ACCOUNT, "codex", "config.toml", 'model = "gpt-test"\n')
+        self.assertTrue(saved["exists"])
+        self.assertEqual(helper._read_config(self.root, ACCOUNT, "codex", "config.toml")["content"], 'model = "gpt-test"\n')
+        with self.assertRaises(helper.HelperError):
+            helper._read_config(self.root, ACCOUNT, "codex", "auth.json")
+        with self.assertRaises(helper.HelperError):
+            helper._write_config(self.root, ACCOUNT, "claude", "settings.json", '{"apiKey":"secret"}')
+
+    def test_config_symlink_is_rejected(self):
+        profile = self.root / ACCOUNT / "claude"
+        helper._mkdir_secure(self.root, profile)
+        outside = self.root.parent / "outside-config-test.json"
+        outside.write_text("{}", encoding="utf-8")
+        (profile / "settings.json").symlink_to(outside)
+        try:
+            with self.assertRaises(helper.HelperError):
+                helper._read_config(self.root, ACCOUNT, "claude", "settings.json")
+        finally:
+            (profile / "settings.json").unlink()
+            outside.unlink()
+
 
 class JSONRPCTest(unittest.TestCase):
     class FakeProcess:

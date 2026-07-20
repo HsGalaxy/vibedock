@@ -22,6 +22,37 @@ permission_policy="${VIBEDOCK_PERMISSION_POLICY:-ask}"
 direct_auto_approve="${VIBEDOCK_DIRECT_AUTO_APPROVE:-false}"
 direct_secret="${VIBEDOCK_DIRECT_API_KEY:-}"
 session_id="${SESSION_ID:-session}"
+launch_command_json="${VIBEDOCK_LAUNCH_COMMAND_JSON:-}"
+config_mode="${VIBEDOCK_CONFIG_MODE:-managed}"
+custom_config_b64="${VIBEDOCK_CUSTOM_CONFIG_B64:-}"
+
+load_compiled_command() {
+  local -n target=$1
+  [[ -n "$launch_command_json" && "$launch_command_json" != "{}" ]] || return 1
+  mapfile -t target < <(python3 - "$launch_command_json" <<'PY'
+import json
+import sys
+try:
+    value = json.loads(sys.argv[1])
+    executable = value["executable"]
+    arguments = value["arguments"]
+    if not isinstance(executable, str) or not isinstance(arguments, list):
+        raise ValueError
+    print(executable)
+    for argument in arguments:
+        if not isinstance(argument, str) or any(ord(char) < 32 for char in argument):
+            raise ValueError
+        print(argument)
+except Exception:
+    raise SystemExit(2)
+PY
+  )
+  [[ ${#target[@]} -gt 0 ]] || return 1
+  for index in "${!target[@]}"; do
+    target[index]="${target[index]/\$HOME/$HOME}"
+  done
+  return 0
+}
 
 if [[ -n "$account_id" ]]; then
   profile_root="/vibedock/credentials/${account_id}"
@@ -64,13 +95,16 @@ lines.extend([
     'env_key = "VIBEDOCK_PROVIDER_TOKEN"',
     '',
 ])
-path = home / "config.toml"
+path = home / "vibedock.config.toml"
 path.write_text("\n".join(lines), encoding="utf-8")
 path.chmod(0o600)
 PY
+    command+=(--profile vibedock)
   elif [[ -n "$model" ]]; then
     command+=(--model "$model")
   fi
+
+  load_compiled_command command || true
 
   "${command[@]}"
 }
@@ -113,6 +147,7 @@ run_claude() {
   if [[ "$agent" == "claude" && "$dangerous_skip" == "true" ]]; then
     command+=(--allow-dangerously-skip-permissions --dangerously-skip-permissions)
   fi
+  load_compiled_command command || true
   "${command[@]}"
 }
 
@@ -128,6 +163,10 @@ run_pi() {
   export VIBEDOCK_DIRECT_MODEL="$direct_model"
   export VIBEDOCK_DIRECT_PROTOCOL="$direct_protocol"
 
+  if [[ "$config_mode" == "custom" ]]; then
+    printf '%s' "$custom_config_b64" | base64 -d >"$root/models.json"
+    chmod 600 "$root/models.json"
+  else
   python3 - <<'PY'
 import json
 import os
@@ -148,11 +187,13 @@ path = root / "models.json"
 path.write_text(json.dumps({"providers": {provider: entry}}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 path.chmod(0o600)
 PY
+  fi
 
   [[ -n "$direct_provider" ]] && command+=(--provider "$direct_provider")
   [[ -n "$direct_model" ]] && command+=(--model "$direct_model")
   [[ -n "$direct_thinking" ]] && command+=(--thinking "$direct_thinking")
   [[ "$permission_policy" == "auto_approve" || "$direct_auto_approve" == "true" ]] && command+=(--approve)
+  load_compiled_command command || true
   "${command[@]}"
 }
 
@@ -172,6 +213,10 @@ run_opencode() {
   export VIBEDOCK_DIRECT_MODEL="$direct_model"
   export VIBEDOCK_DIRECT_PROTOCOL="$direct_protocol"
 
+  if [[ "$config_mode" == "custom" ]]; then
+    printf '%s' "$custom_config_b64" | base64 -d >"$config"
+    chmod 600 "$config"
+  else
   python3 - <<'PY'
 import json
 import os
@@ -198,10 +243,12 @@ path = Path(os.environ["OPENCODE_CONFIG"])
 path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 path.chmod(0o600)
 PY
+  fi
 
   [[ -n "$direct_model" ]] && command+=(--model "${direct_provider}/${direct_model}")
   [[ "$permission_policy" == "auto_approve" || "$direct_auto_approve" == "true" ]] && command+=(--auto)
   command+=(/workspace)
+  load_compiled_command command || true
   "${command[@]}"
 }
 
@@ -224,5 +271,10 @@ case "$agent" in
     ;;
   *)
     printf '\033[1;32mVibeDock · Shell\033[0m\n'
+    if [[ -n "$launch_command_json" && "$launch_command_json" != "{}" ]]; then
+      local_dummy=()
+      load_compiled_command local_dummy || true
+      "${local_dummy[@]}"
+    fi
     ;;
 esac

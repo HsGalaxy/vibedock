@@ -58,6 +58,7 @@ type Server struct {
 	ensureCalls             map[string]*ensureSessionCall
 	accountOperationMu      sync.Mutex
 	auth                    *accountAuthManager
+	configRuntime           model.AccountConfigRuntime
 	controlPlaneAuthEnabled bool
 }
 
@@ -80,14 +81,23 @@ func NewServerWithAuth(st *store.Store, runtime model.Runtime, authRuntime model
 		templateList: append([]model.Template(nil), templates...), web: web,
 		logger: logger, keyring: keyring, ensureCalls: make(map[string]*ensureSessionCall),
 		auth:                    newAccountAuthManager(authRuntime, authOptions),
+		configRuntime:           accountConfigRuntime(authRuntime),
 		controlPlaneAuthEnabled: authOptions.ControlPlaneAuthEnabled,
 	}
+}
+
+func accountConfigRuntime(runtime model.AuthRuntime) model.AccountConfigRuntime {
+	if value, ok := runtime.(model.AccountConfigRuntime); ok {
+		return value
+	}
+	return nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/templates", s.handleTemplates)
+	mux.HandleFunc("POST /api/launch-preview", s.handleLaunchPreview)
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
 	mux.HandleFunc("PATCH /api/accounts/{account}", s.handleUpdateAccount)
@@ -98,6 +108,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/accounts/{account}/login-attempts/{attempt}", s.handleCancelAccountLogin)
 	mux.HandleFunc("POST /api/accounts/{account}/logout", s.handleAccountLogout)
 	mux.HandleFunc("DELETE /api/accounts/{account}", s.handleDeleteAccount)
+	mux.HandleFunc("GET /api/accounts/{account}/config", s.handleAccountConfigList)
+	mux.HandleFunc("GET /api/accounts/{account}/config/{path}", s.handleAccountConfigFile)
+	mux.HandleFunc("PUT /api/accounts/{account}/config/{path}", s.handleAccountConfigFile)
+	mux.HandleFunc("DELETE /api/accounts/{account}/config/{path}", s.handleAccountConfigFile)
 	mux.HandleFunc("/auth/accounts/{account}/login-attempts/{attempt}/terminal/", s.handleAccountAuthTerminal)
 	mux.HandleFunc("GET /api/workspaces", s.handleWorkspaces)
 	mux.HandleFunc("POST /api/workspaces", s.handleCreateWorkspace)
@@ -449,13 +463,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	ws = s.migrateWorkspace(ws)
 	var input struct {
-		Name                     string           `json:"name"`
-		Agent                    string           `json:"agent"`
-		AccountID                string           `json:"account_id"`
-		PermissionMode           string           `json:"permission_mode"`
-		DangerousSkipPermissions bool             `json:"dangerous_skip_permissions"`
-		DangerousConfirmation    string           `json:"dangerous_confirmation"`
-		DirectConfig             directAgentInput `json:"direct_config"`
+		Name                     string                    `json:"name"`
+		Agent                    string                    `json:"agent"`
+		AccountID                string                    `json:"account_id"`
+		PermissionMode           string                    `json:"permission_mode"`
+		DangerousSkipPermissions bool                      `json:"dangerous_skip_permissions"`
+		DangerousConfirmation    string                    `json:"dangerous_confirmation"`
+		DirectConfig             directAgentInput          `json:"direct_config"`
+		LaunchProfile            *model.AgentLaunchProfile `json:"launch_profile"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误", err)
@@ -492,6 +507,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	session.PermissionMode = permissionMode
 	session.DangerousSkipPermissions = input.DangerousSkipPermissions
+	launchProfile, err := normalizeLaunchProfile(agent, input.LaunchProfile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "启动参数无效", err)
+		return
+	}
+	session.LaunchProfile = launchProfile
 	if err := s.saveDirectSecret(session.ID, input.DirectConfig); err != nil {
 		writeError(w, http.StatusInternalServerError, "无法保存 Session API Key", err)
 		return
@@ -523,13 +544,14 @@ func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Name                     *string           `json:"name"`
-		Agent                    *string           `json:"agent"`
-		AccountID                *string           `json:"account_id"`
-		PermissionMode           *string           `json:"permission_mode"`
-		DangerousSkipPermissions *bool             `json:"dangerous_skip_permissions"`
-		DangerousConfirmation    string            `json:"dangerous_confirmation"`
-		DirectConfig             *directAgentInput `json:"direct_config"`
+		Name                     *string                   `json:"name"`
+		Agent                    *string                   `json:"agent"`
+		AccountID                *string                   `json:"account_id"`
+		PermissionMode           *string                   `json:"permission_mode"`
+		DangerousSkipPermissions *bool                     `json:"dangerous_skip_permissions"`
+		DangerousConfirmation    string                    `json:"dangerous_confirmation"`
+		DirectConfig             *directAgentInput         `json:"direct_config"`
+		LaunchProfile            *model.AgentLaunchProfile `json:"launch_profile"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误", err)
@@ -552,8 +574,20 @@ func (s *Server) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 			session.Agent = agent
 			session.PermissionMode = ""
 			session.DangerousSkipPermissions = false
+			session.LaunchProfile = nil
 			restartNeeded = true
 		}
+	}
+	if input.LaunchProfile != nil {
+		launchProfile, err := normalizeLaunchProfile(session.Agent, input.LaunchProfile)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "启动参数无效", err)
+			return
+		}
+		if !launchProfilesEqual(session.LaunchProfile, launchProfile) {
+			restartNeeded = true
+		}
+		session.LaunchProfile = launchProfile
 	}
 	if input.AccountID != nil {
 		accountID := strings.TrimSpace(*input.AccountID)

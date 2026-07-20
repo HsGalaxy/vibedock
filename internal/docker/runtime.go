@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -444,6 +445,7 @@ func (r *Runtime) CaptureSession(ctx model.Context, containerName, sessionID str
 }
 
 func sessionBootstrapScript(req model.SessionRuntimeRequest, restart bool) string {
+	launchCommandJSON, _ := json.Marshal(req.LaunchCommand)
 	values := map[string]string{
 		"WORKSPACE_ID":             req.WorkspaceID,
 		"SESSION_ID":               req.SessionID,
@@ -469,6 +471,9 @@ func sessionBootstrapScript(req model.SessionRuntimeRequest, restart bool) strin
 		"VIBEDOCK_PERMISSION_POLICY":   req.Direct.PermissionPolicy,
 		"VIBEDOCK_DIRECT_AUTO_APPROVE": strconv.FormatBool(req.Direct.AutoApprove),
 		"VIBEDOCK_DIRECT_API_KEY":      req.Direct.Secret,
+		"VIBEDOCK_LAUNCH_COMMAND_JSON": string(launchCommandJSON),
+		"VIBEDOCK_CONFIG_MODE":         req.ConfigMode,
+		"VIBEDOCK_CUSTOM_CONFIG_B64":   base64.StdEncoding.EncodeToString([]byte(req.CustomConfig)),
 	}
 	keys := make([]string, 0, len(req.Account.ExtraEnv))
 	for key := range req.Account.ExtraEnv {
@@ -654,6 +659,9 @@ write_export VIBEDOCK_DIRECT_THINKING "${VIBEDOCK_DIRECT_THINKING:-}"
 write_export VIBEDOCK_PERMISSION_POLICY "${VIBEDOCK_PERMISSION_POLICY:-ask}"
 write_export VIBEDOCK_DIRECT_AUTO_APPROVE "${VIBEDOCK_DIRECT_AUTO_APPROVE:-false}"
 write_export VIBEDOCK_DIRECT_API_KEY "${VIBEDOCK_DIRECT_API_KEY:-}"
+write_export VIBEDOCK_LAUNCH_COMMAND_JSON "${VIBEDOCK_LAUNCH_COMMAND_JSON:-}"
+write_export VIBEDOCK_CONFIG_MODE "${VIBEDOCK_CONFIG_MODE:-managed}"
+write_export VIBEDOCK_CUSTOM_CONFIG_B64 "${VIBEDOCK_CUSTOM_CONFIG_B64:-}"
 IFS=',' read -r -a extra_keys <<<"${VIBEDOCK_EXTRA_ENV_KEYS:-}"
 for key in "${extra_keys[@]}"; do
   [[ -n "$key" ]] || continue

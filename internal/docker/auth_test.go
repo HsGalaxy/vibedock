@@ -156,6 +156,29 @@ exit 1
 	}
 }
 
+func TestAccountConfigWriteKeepsHelperStdinAttached(t *testing.T) {
+	script := `
+printf '%s\n' "$*" >>"$COMMAND_LOG"
+case "$*" in
+  *" config-write "*) printf '%s\n' '{"protocol":1,"path":"config.toml","exists":true,"content":"ok"}'; exit 0 ;;
+esac
+exit 1
+`
+	docker, logPath := writeAuthDocker(t, script)
+	runtime := New(docker, "vibedock")
+	document, err := runtime.WriteAccountConfig(context.Background(), testAuthAccount, model.AuthProviderCodex, "config.toml", "model = \"gpt-test\"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.Content != "ok" {
+		t.Fatalf("unexpected config document: %#v", document)
+	}
+	commands := readCommands(t, logPath)
+	if !strings.Contains(commands, "run --rm -i") {
+		t.Fatalf("config write did not attach stdin: %s", commands)
+	}
+}
+
 func TestCredentialCleanupUsesOpaqueFixedOperations(t *testing.T) {
 	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
 case "$1" in

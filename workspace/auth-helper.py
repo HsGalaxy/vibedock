@@ -27,6 +27,11 @@ import time
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import urlsplit
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - the pinned image has tomllib
+    tomllib = None
+
 PROTOCOL_VERSION = 1
 CODEX_VERSION = "0.144.6"
 CLAUDE_VERSION = "2.1.215"
@@ -42,6 +47,8 @@ ATTEMPT_RE = re.compile(r"^[a-z0-9]{24}$")
 CLEANUP_RE = re.compile(r"^[a-z0-9]{32}$")
 USER_CODE_RE = re.compile(r"^[A-Z0-9-]{4,32}$")
 PROVIDERS = {"codex", "claude"}
+CONFIG_FILES = {"codex": ("config.toml",), "claude": ("settings.json",)}
+MAX_CONFIG_BYTES = 256 << 10
 TERMINAL_STATES = {"completed", "cancelled", "expired", "failed"}
 OFFICIAL_CODEX_URLS = {("auth.openai.com", "/codex/device")}
 GENERIC_MESSAGES = {
@@ -221,6 +228,109 @@ def _read_json(root: Path, path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HelperError("invalid_state")
     return value
+
+
+def _config_path(root: Path, account: str, provider: str, name: str) -> Path:
+    validate_account(account)
+    validate_provider(provider)
+    if name not in CONFIG_FILES[provider]:
+        raise HelperError("config_path_not_allowed")
+    root = _ensure_root(root)
+    base = root / account / provider
+    _assert_components(root, base)
+    return base / name
+
+
+def _config_content_is_safe(provider: str, content: str) -> None:
+    if len(content.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise HelperError("config_too_large")
+    try:
+        if provider == "codex":
+            if tomllib is None:
+                raise HelperError("config_parser_unavailable")
+            value = tomllib.loads(content)
+        else:
+            value = json.loads(content)
+    except (UnicodeError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError if tomllib else ValueError):
+        raise HelperError("config_invalid") from None
+    if not isinstance(value, dict):
+        raise HelperError("config_invalid")
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                lowered = str(key).lower()
+                if any(word in lowered for word in ("apikey", "api_key", "token", "password", "secret", "oauth")):
+                    raise HelperError("config_protected")
+                walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+
+
+def _read_config(root: Path, account: str, provider: str, name: str) -> dict[str, Any]:
+    path = _config_path(root, account, provider, name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"protocol": PROTOCOL_VERSION, "path": name, "exists": False, "content": ""}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
+        raise HelperError("config_invalid")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise HelperError("config_invalid") from None
+    _config_content_is_safe(provider, content)
+    return {"protocol": PROTOCOL_VERSION, "path": name, "exists": True, "content": content}
+
+
+def _write_config(root: Path, account: str, provider: str, name: str, content: str) -> dict[str, Any]:
+    path = _config_path(root, account, provider, name)
+    _config_content_is_safe(provider, content)
+    _mkdir_secure(root, path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+    return _read_config(root, account, provider, name)
+
+
+def list_config(root: Path, account: str, provider: str) -> dict[str, Any]:
+    files = []
+    for name in CONFIG_FILES[provider]:
+        path = _config_path(root, account, provider, name)
+        exists = False
+        size = 0
+        try:
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise HelperError("config_invalid")
+            exists, size = True, info.st_size
+        except FileNotFoundError:
+            pass
+        files.append({"path": name, "exists": exists, "editable": True, "size": size})
+    return {"protocol": PROTOCOL_VERSION, "files": files}
+
+
+def reset_config(root: Path, account: str, provider: str, name: str) -> dict[str, Any]:
+    path = _config_path(root, account, provider, name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"protocol": PROTOCOL_VERSION, "removed": False}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise HelperError("config_invalid")
+    os.unlink(path)
+    return {"protocol": PROTOCOL_VERSION, "removed": True}
 
 
 def paths(root: Path, account: str, attempt: str, provider: str) -> dict[str, Path]:
@@ -1186,6 +1296,14 @@ def _parser() -> argparse.ArgumentParser:
         child = subparsers.add_parser(operation, add_help=False, allow_abbrev=False)
         child.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
         child.add_argument("--account", required=True)
+    child = subparsers.add_parser("config-list", add_help=False, allow_abbrev=False)
+    child.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
+    child.add_argument("--account", required=True)
+    for operation in ("config-read", "config-write", "config-reset"):
+        child = subparsers.add_parser(operation, add_help=False, allow_abbrev=False)
+        child.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
+        child.add_argument("--account", required=True)
+        child.add_argument("--path", required=True)
     for operation in ("cleanup-prepare", "cleanup-commit", "cleanup-rollback"):
         child = subparsers.add_parser(operation, add_help=False, allow_abbrev=False)
         child.add_argument("--account", required=True)
@@ -1226,6 +1344,21 @@ def main(argv: list[str] | None = None) -> int:
         elif args.operation == "logout":
             compatibility_manifest(True)
             result = provider_logout(root, args.account, args.provider)
+        elif args.operation == "config-list":
+            result = list_config(root, args.account, args.provider)
+        elif args.operation == "config-read":
+            result = _read_config(root, args.account, args.provider, args.path)
+        elif args.operation == "config-write":
+            content_bytes = sys.stdin.buffer.read(MAX_CONFIG_BYTES + 1)
+            if len(content_bytes) > MAX_CONFIG_BYTES:
+                raise HelperError("config_too_large")
+            try:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HelperError("config_invalid") from None
+            result = _write_config(root, args.account, args.provider, args.path, content)
+        elif args.operation == "config-reset":
+            result = reset_config(root, args.account, args.provider, args.path)
         elif args.operation == "cleanup-prepare":
             result = prepare_cleanup(root, args.account, args.cleanup, args.now)
         elif args.operation == "cleanup-commit":

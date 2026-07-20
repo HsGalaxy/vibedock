@@ -304,6 +304,17 @@ textarea { resize: vertical; }
 .check-row { display: flex; align-items: center; gap: 8px; color: var(--soft); font-size: 12px; margin-top: 10px; }
 .check-row input { width: auto; }
 .direct-config-panel { border: 1px solid var(--line); background: var(--bg); border-radius: var(--radius-md); padding: 16px; }
+.launch-profile-panel { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 18px; }
+.launch-profile-panel .direct-config-head { margin-bottom: 14px; }
+.agent-config-editor { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
+.config-editor-toolbar { display: grid; grid-template-columns: minmax(180px,240px) minmax(0,1fr); align-items: end; gap: 12px; }
+.config-editor-toolbar code { justify-self: end; margin-bottom: 9px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.code-textarea { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.55; tab-size: 2; white-space: pre; }
+.launch-advanced { margin-top: 16px; }
+.launch-advanced .field + .field { margin-top: 12px; }
+.launch-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 16px; color: var(--soft); font-size: 12px; font-weight: 600; }
+.launch-command-preview { min-height: 48px; max-height: 132px; overflow: auto; margin: 7px 0 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-inset); color: var(--soft); font-size: 12px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.launch-warnings { margin-top: 8px; color: var(--warning); font-size: 11px; line-height: 1.5; }
 .field-action-row { display: flex; align-items: center; gap: 8px; }
 .field-action-row select { min-width: 0; flex: 1; }
 .field-action-row .button { white-space: nowrap; }
@@ -332,6 +343,16 @@ textarea { resize: vertical; }
 .account-details b, .settings-row b, .settings-row code { color: var(--soft); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .account-card-actions .button { padding: 5px 10px; font-size: 12px; }
+.account-config-layout { display: grid; grid-template-columns: 190px minmax(0,1fr); gap: 14px; min-height: 420px; }
+#accountConfigDialog { padding: 24px; }
+.config-tree { border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--bg); padding: 7px; display: flex; flex-direction: column; gap: 3px; align-content: start; }
+.config-tree button { border: 1px solid transparent; border-radius: var(--radius); background: transparent; color: var(--muted); padding: 8px 9px; text-align: left; cursor: pointer; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+.config-tree button:hover, .config-tree button.selected { background: var(--accent-subtle); border-color: var(--accent-muted); color: var(--text); }
+.config-tree button small { display: block; margin-top: 2px; color: var(--subtle); font-family: inherit; font-size: 10px; }
+.account-config-editor { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.account-config-editor .code-textarea { flex: 1; min-height: 360px; }
+.account-config-editor .code-textarea:read-only { color: var(--muted); }
+.account-config-state { color: var(--muted); font-size: 11px; }
 
 /* Official account login */
 .visually-hidden {
@@ -475,6 +496,10 @@ textarea { resize: vertical; }
   .pane-grid.split { grid-template-columns: 1fr; grid-template-rows: minmax(0,var(--split-top,50%)) 5px minmax(0,1fr); }
   .pane-divider { cursor: row-resize; }
   .template-picker, .form-grid, .account-grid, .account-onboarding, .provider-login-panel { grid-template-columns: 1fr; }
+  .account-config-layout { grid-template-columns: 1fr; }
+  .config-tree { min-height: 0; }
+  .config-editor-toolbar { grid-template-columns: 1fr; }
+  .config-editor-toolbar code { justify-self: start; margin: 0; }
   .field.full, .direct-config-panel.full { grid-column: auto; }
   .quick-start-grid { grid-template-columns: 1fr; }
   .provider-login-panel { gap: 14px; }
@@ -483,6 +508,7 @@ textarea { resize: vertical; }
 @media (max-width: 480px) {
   .modal { width: calc(100vw - 16px); max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
   .modal form, .accounts-shell, #settingsContent { padding: 18px; }
+  #accountConfigDialog { padding: 18px; }
   .accounts-shell .dialog-header { gap: 10px; }
   .provider-login-panel { padding: 14px; }
   .provider-login-button { width: 100%; }

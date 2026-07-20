@@ -104,6 +104,12 @@ The initial supported editable files are deliberately narrow:
 - Claude Code: JSON settings files explicitly added to the Claude policy after
   compatibility verification against the pinned CLI version.
 
+For Codex API-key or bearer-token accounts, VibeDock writes its provider
+bridge to the hidden `vibedock.config.toml` profile and launches Codex with
+`--profile vibedock`. The user-editable `config.toml` is therefore never
+overwritten by a Session restart. Official-login accounts do not receive this
+generated profile.
+
 The policy can grow without turning the endpoint into arbitrary filesystem
 access.
 

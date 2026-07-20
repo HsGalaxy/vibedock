@@ -15,19 +15,36 @@ type Template struct {
 }
 
 type Session struct {
-	ID                       string             `json:"id"`
-	Name                     string             `json:"name"`
-	Agent                    string             `json:"agent"`
-	AccountID                string             `json:"account_id,omitempty"`
-	DirectConfig             *DirectAgentConfig `json:"direct_config,omitempty"`
-	TmuxName                 string             `json:"tmux_name"`
-	Port                     int                `json:"port,omitempty"`
-	Status                   string             `json:"status"`
-	CreatedAt                time.Time          `json:"created_at"`
-	UpdatedAt                time.Time          `json:"updated_at"`
-	Error                    string             `json:"error,omitempty"`
-	PermissionMode           string             `json:"permission_mode,omitempty"`
-	DangerousSkipPermissions bool               `json:"dangerous_skip_permissions,omitempty"`
+	ID                       string              `json:"id"`
+	Name                     string              `json:"name"`
+	Agent                    string              `json:"agent"`
+	AccountID                string              `json:"account_id,omitempty"`
+	DirectConfig             *DirectAgentConfig  `json:"direct_config,omitempty"`
+	LaunchProfile            *AgentLaunchProfile `json:"launch_profile,omitempty"`
+	TmuxName                 string              `json:"tmux_name"`
+	Port                     int                 `json:"port,omitempty"`
+	Status                   string              `json:"status"`
+	CreatedAt                time.Time           `json:"created_at"`
+	UpdatedAt                time.Time           `json:"updated_at"`
+	Error                    string              `json:"error,omitempty"`
+	PermissionMode           string              `json:"permission_mode,omitempty"`
+	DangerousSkipPermissions bool                `json:"dangerous_skip_permissions,omitempty"`
+}
+
+// AgentLaunchProfile contains only non-secret, Session-scoped launch choices.
+// A nil profile means legacy defaults and remains valid for existing state.
+type AgentLaunchProfile struct {
+	Version              int      `json:"version,omitempty"`
+	Model                string   `json:"model,omitempty"`
+	CodexApproval        string   `json:"codex_approval,omitempty"`
+	CodexSandbox         string   `json:"codex_sandbox,omitempty"`
+	CodexWebSearch       bool     `json:"codex_web_search,omitempty"`
+	CodexConfigOverrides []string `json:"codex_config_overrides,omitempty"`
+	ClaudeContinue       bool     `json:"claude_continue,omitempty"`
+	OpenCodeContinue     bool     `json:"opencode_continue,omitempty"`
+	ExtraArgs            []string `json:"extra_args,omitempty"`
+	ConfigMode           string   `json:"config_mode,omitempty"`
+	CustomConfig         string   `json:"custom_config,omitempty"`
 }
 
 // DirectAgentConfig belongs to a single Session. It is used by agents that do
@@ -148,6 +165,18 @@ type SessionRuntimeRequest struct {
 	DangerousSkipPermissions bool
 	Account                  AccountRuntime
 	Direct                   DirectAgentRuntime
+	LaunchCommand            LaunchCommand
+	ConfigMode               string
+	CustomConfig             string
+}
+
+// LaunchCommand is compiled by the control plane and is used unchanged for
+// both the browser preview and runtime execution.
+type LaunchCommand struct {
+	Executable string   `json:"executable"`
+	Arguments  []string `json:"arguments"`
+	Preview    string   `json:"preview,omitempty"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 type AccountRuntime struct {

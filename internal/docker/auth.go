@@ -226,7 +226,14 @@ func (r *Runtime) authProtocol(ctx context.Context) error {
 }
 
 func (r *Runtime) authOneShotJSON(ctx context.Context, network bool, operation string, operationArgs []string, result any) error {
+	return r.authOneShotJSONInput(ctx, network, operation, operationArgs, "", result)
+}
+
+func (r *Runtime) authOneShotJSONInput(ctx context.Context, network bool, operation string, operationArgs []string, input string, result any) error {
 	args := []string{"run", "--rm"}
+	if input != "" {
+		args = append(args, "-i")
+	}
 	if network && (operation == "status" || operation == "logout") {
 		accountID, accountOK := authOperationArg(operationArgs, "--account")
 		provider, providerOK := authOperationArg(operationArgs, "--provider")
@@ -246,7 +253,7 @@ func (r *Runtime) authOneShotJSON(ctx context.Context, network bool, operation s
 	args = append(args, authOneShotDockerArgs(r.Network, network)...)
 	args = append(args, "--entrypoint", authHelperEntrypoint, authHelperImage(), operation)
 	args = append(args, operationArgs...)
-	output, err := r.authRun(ctx, operation, args...)
+	output, err := r.authRunWithInput(ctx, operation, input, args...)
 	if err != nil {
 		return err
 	}
@@ -258,6 +265,129 @@ func (r *Runtime) authOneShotJSON(ctx context.Context, network bool, operation s
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return errors.New("authentication helper returned an incompatible response")
+	}
+	return nil
+}
+
+func validateAccountConfigPath(provider model.AuthProvider, path string) error {
+	if path == "" || strings.Contains(path, "/") || strings.Contains(path, "\\") || path == "." || path == ".." {
+		return errors.New("invalid account configuration path")
+	}
+	switch provider {
+	case model.AuthProviderCodex:
+		if path != "config.toml" {
+			return errors.New("configuration path is not allowlisted")
+		}
+	case model.AuthProviderClaude:
+		if path != "settings.json" {
+			return errors.New("configuration path is not allowlisted")
+		}
+	default:
+		return errors.New("unsupported configuration provider")
+	}
+	return nil
+}
+
+func (r *Runtime) ListAccountConfig(ctx model.Context, accountID string, provider model.AuthProvider) ([]model.AccountConfigFile, error) {
+	if err := validateAuthAccount(accountID); err != nil {
+		return nil, err
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return nil, err
+	}
+	var response struct {
+		Protocol int                       `json:"protocol"`
+		Files    []model.AccountConfigFile `json:"files"`
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
+	defer cancel()
+	if err := r.authOneShotJSON(cctx, false, "config-list", []string{"--account", accountID, "--provider", string(provider)}, &response); err != nil {
+		return nil, err
+	}
+	if response.Protocol != authHelperProtocol {
+		return nil, errors.New("configuration helper protocol incompatible")
+	}
+	return response.Files, nil
+}
+
+func (r *Runtime) ReadAccountConfig(ctx model.Context, accountID string, provider model.AuthProvider, path string) (model.AccountConfigDocument, error) {
+	if err := validateAuthAccount(accountID); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if err := validateAccountConfigPath(provider, path); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	var response struct {
+		Protocol int    `json:"protocol"`
+		Path     string `json:"path"`
+		Exists   bool   `json:"exists"`
+		Content  string `json:"content"`
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
+	defer cancel()
+	if err := r.authOneShotJSON(cctx, false, "config-read", []string{"--account", accountID, "--provider", string(provider), "--path", path}, &response); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if response.Protocol != authHelperProtocol || response.Path != path {
+		return model.AccountConfigDocument{}, errors.New("configuration helper protocol incompatible")
+	}
+	return model.AccountConfigDocument{Path: response.Path, Exists: response.Exists, Content: response.Content}, nil
+}
+
+func (r *Runtime) WriteAccountConfig(ctx model.Context, accountID string, provider model.AuthProvider, path, content string) (model.AccountConfigDocument, error) {
+	if err := validateAuthAccount(accountID); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if err := validateAccountConfigPath(provider, path); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if len(content) == 0 || len(content) > 256<<10 {
+		return model.AccountConfigDocument{}, errors.New("configuration content is empty or too large")
+	}
+	var response struct {
+		Protocol int    `json:"protocol"`
+		Path     string `json:"path"`
+		Exists   bool   `json:"exists"`
+		Content  string `json:"content"`
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
+	defer cancel()
+	if err := r.authOneShotJSONInput(cctx, false, "config-write", []string{"--account", accountID, "--provider", string(provider), "--path", path}, content, &response); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
+	if response.Protocol != authHelperProtocol || response.Path != path {
+		return model.AccountConfigDocument{}, errors.New("configuration helper protocol incompatible")
+	}
+	return model.AccountConfigDocument{Path: response.Path, Exists: response.Exists, Content: response.Content}, nil
+}
+
+func (r *Runtime) ResetAccountConfig(ctx model.Context, accountID string, provider model.AuthProvider, path string) error {
+	if err := validateAuthAccount(accountID); err != nil {
+		return err
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return err
+	}
+	if err := validateAccountConfigPath(provider, path); err != nil {
+		return err
+	}
+	var response struct {
+		Protocol int  `json:"protocol"`
+		Removed  bool `json:"removed"`
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
+	defer cancel()
+	if err := r.authOneShotJSON(cctx, false, "config-reset", []string{"--account", accountID, "--provider", string(provider), "--path", path}, &response); err != nil {
+		return err
+	}
+	if response.Protocol != authHelperProtocol {
+		return errors.New("configuration helper protocol incompatible")
 	}
 	return nil
 }
