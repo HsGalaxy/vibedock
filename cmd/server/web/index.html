@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#07090d" />
+  <title>VibeDock 0.5</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <section id="dashboardView" class="dashboard-view">
+    <header class="dashboard-header shell-width">
+      <button class="brand-button" data-home aria-label="回到 Workspace 列表">
+        <span class="logo">VD</span>
+        <span class="brand-copy"><strong>VibeDock</strong><small>Workspace control plane</small></span>
+      </button>
+      <div class="dashboard-actions">
+        <span id="healthBadge" class="health-badge"><i></i> 控制面正常</span>
+        <button id="openAccounts" class="button ghost">账号与 Provider</button>
+        <button id="refreshButton" class="icon-button" title="刷新 Workspace 列表" aria-label="刷新 Workspace 列表">↻</button>
+      </div>
+    </header>
+
+    <main class="shell-width dashboard-main">
+      <section class="dashboard-summary">
+        <div>
+          <h1>Workspaces</h1>
+          <p>管理持久化 Docker 开发环境、运行状态、资源配额和 Agent 会话。</p>
+        </div>
+        <div class="launch-actions">
+          <button class="button ghost" id="quickImportButton">从 ZIP / 文件创建</button>
+          <button class="button primary" data-create>新建 Workspace</button>
+        </div>
+      </section>
+
+      <section class="recent-heading">
+        <div><h2>全部 Workspace</h2><p id="workspaceListSummary">正在加载环境…</p></div>
+        <div class="workspace-heading-actions">
+          <div class="filter-row" aria-label="筛选 Workspace">
+            <button class="chip active" data-filter="all">全部</button>
+            <button class="chip" data-filter="running">运行中</button>
+            <button class="chip" data-filter="stopped">已停止</button>
+          </div>
+          <button id="manageWorkspacesButton" class="button ghost small" aria-pressed="false">批量管理</button>
+        </div>
+      </section>
+      <section id="workspaceBatchToolbar" class="workspace-batch-toolbar hidden" aria-label="批量管理 Workspace">
+        <label class="batch-select-all"><input id="workspaceSelectAll" type="checkbox" /> <span>选择当前列表</span></label>
+        <span id="workspaceSelectionSummary" class="batch-summary" aria-live="polite">未选择 Workspace</span>
+        <div class="batch-actions">
+          <button id="batchStartButton" class="button ghost small" disabled>启动</button>
+          <button id="batchStopButton" class="button ghost small" disabled>停止</button>
+          <button id="batchDeleteButton" class="button danger small" disabled>删除</button>
+          <button id="exitManageButton" class="button subtle small">退出管理</button>
+        </div>
+      </section>
+      <section id="workspaceBatchResults" class="workspace-batch-results hidden" aria-live="polite"></section>
+      <section id="workspaceGrid" class="workspace-grid"></section>
+      <section id="emptyState" class="empty-state hidden">
+        <div class="empty-orbit"><span>＋</span></div>
+        <h3>创建你的第一个工作环境</h3>
+        <p>选择模板、导入项目，几秒后进入全屏工作台。</p>
+        <button class="button primary" id="emptyStateAction" data-create>创建 Workspace</button>
+      </section>
+    </main>
+  </section>
+
+  <section id="workspaceView" class="workbench hidden">
+    <header class="workbench-titlebar">
+      <div class="titlebar-left">
+        <button class="icon-button compact" data-home title="返回项目列表">←</button>
+        <span id="workspaceIcon" class="workspace-avatar">◆</span>
+        <div class="workspace-identity">
+          <strong id="workspaceName">Workspace</strong>
+          <small id="workspaceSubtitle">loading...</small>
+        </div>
+        <span id="workspaceStatus" class="status-badge"></span>
+      </div>
+      <div class="titlebar-center">
+        <button id="commandButton" class="command-trigger"><span>搜索命令、会话和工具</span><kbd>⌘ K</kbd></button>
+      </div>
+      <div class="titlebar-actions">
+        <button id="workspacePowerButton" class="icon-button compact" title="启动或停止环境">◉</button>
+        <button id="workspaceSettingsButton" class="icon-button compact" title="Workspace 设置">⚙</button>
+      </div>
+    </header>
+
+    <div class="workbench-body">
+      <nav class="activity-bar" aria-label="Workspace 快速工具">
+        <div class="activity-top">
+          <button class="activity-item active" data-activity="sessions" aria-label="Agent Sessions" title="Agent Sessions"><span>◈</span><small>Agent</small></button>
+          <button class="activity-item" data-activity="code" aria-label="打开 VS Code" title="VS Code"><span>⌘</span><small>Code</small></button>
+          <button class="activity-item" data-activity="preview" aria-label="打开应用预览" title="应用预览"><span>◎</span><small>Preview</small></button>
+          <button class="activity-item" data-activity="terminal" aria-label="新建 Shell" title="新建 Shell"><span>&gt;_</span><small>Shell</small></button>
+          <button class="activity-item" data-activity="files" aria-label="导入文件" title="导入文件"><span>⇧</span><small>Import</small></button>
+        </div>
+        <div class="activity-bottom">
+          <button class="activity-item" data-activity="accounts" aria-label="账号与 API" title="账号与 API"><span>♙</span><small>Accounts</small></button>
+          <button class="activity-item" data-activity="settings" aria-label="Workspace 设置" title="Workspace 设置"><span>⚙</span><small>Settings</small></button>
+        </div>
+      </nav>
+      <aside id="workspaceSidebar" class="workbench-sidebar">
+        <div class="sidebar-header">
+          <div><span>WORKSPACE</span><strong>Agent Sessions</strong></div>
+          <button id="newSessionButton" class="icon-button compact" title="新建 Session">＋</button>
+        </div>
+        <div class="sidebar-section">
+          <div id="sessionList" class="session-list"></div>
+          <div id="sessionEmpty" class="session-empty hidden">
+            <p>还没有 Agent Session</p>
+            <button class="button ghost small" data-new-session>创建一个</button>
+          </div>
+        </div>
+        <section class="resource-monitor" aria-labelledby="resourceMonitorTitle">
+          <div class="resource-monitor-head">
+            <div><span>LIVE RESOURCES</span><strong id="resourceMonitorTitle">Workspace monitor</strong></div>
+            <span id="resourceContainerState" class="resource-state">—</span>
+          </div>
+          <div class="resource-stat">
+            <div class="resource-stat-line"><span>CPU now</span><b id="resourceCPU">—</b></div>
+            <small id="resourceCPULimit">配置上限 —</small>
+          </div>
+          <div class="resource-stat">
+            <div class="resource-stat-line"><span>Memory</span><b id="resourceMemory">—</b></div>
+            <div id="resourceMemoryMeter" class="resource-meter" role="meter" aria-label="Workspace 内存使用量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
+            <small id="resourceMemoryRemaining">剩余 —</small>
+          </div>
+          <div class="resource-stat compact">
+            <div class="resource-stat-line"><span>Sessions</span><b id="resourceSessions">—</b></div>
+          </div>
+          <p id="resourceSampleStatus" class="resource-sample-status" aria-live="polite">等待实时采样</p>
+        </section>
+      </aside>
+
+      <main class="editor-shell">
+        <div class="tabbar-row">
+          <div id="tabStrip" class="tab-strip" role="tablist" aria-label="Workspace 工具标签"></div>
+          <div class="editor-actions">
+            <button id="reloadPaneButton" class="icon-button compact" title="重新加载当前页">↻</button>
+            <button id="openExternalButton" class="icon-button compact" title="新窗口打开">↗</button>
+            <button id="sendToOtherPaneButton" class="icon-button compact" title="在另一侧打开">⇥</button>
+            <button id="splitButton" class="icon-button compact" title="切换分屏">◫</button>
+            <button id="fullscreenButton" class="icon-button compact" title="沉浸全屏">⛶</button>
+          </div>
+        </div>
+
+        <div id="paneGrid" class="pane-grid">
+          <section class="work-pane focused" data-pane="primary">
+            <div class="pane-head"><span id="primaryPaneLabel">主工作区</span><small>点击后成为活动面板</small></div>
+            <div class="pane-content-placeholder" aria-hidden="true"></div>
+          </section>
+          <div id="paneDivider" class="pane-divider hidden" role="separator" aria-orientation="vertical" aria-label="调整分屏大小" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0"></div>
+          <section class="work-pane secondary hidden" data-pane="secondary">
+            <div class="pane-head"><span id="secondaryPaneLabel">辅助工作区</span><small>预览或并行 Agent</small></div>
+            <div class="pane-content-placeholder" aria-hidden="true"></div>
+          </section>
+          <div id="paneViewLayer" class="pane-view-layer" aria-live="off"></div>
+        </div>
+
+        <footer class="statusbar">
+          <div class="status-left">
+            <span id="statusWorkspace">Workspace</span>
+            <span id="statusSession">No active session</span>
+          </div>
+          <div class="status-right">
+            <button id="uploadFilesButton" class="status-button">⇧ 导入文件</button>
+            <button id="previewButton" class="status-button">◎ Preview</button>
+            <span class="status-button">✓ VS Code 已授权</span>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <div id="dropOverlay" class="drop-overlay hidden">
+      <div><span>⇧</span><strong>导入到 /workspace</strong><small>松开鼠标上传 ZIP 或文件</small></div>
+    </div>
+  </section>
+  <dialog id="createDialog" class="modal wide-modal">
+    <form id="createForm" enctype="multipart/form-data">
+      <div class="dialog-header">
+        <div><div class="eyebrow">NEW WORKSPACE</div><h3>创建开发环境</h3><p>选择镜像，导入项目，然后立即进入工作台。</p></div>
+        <button type="button" class="icon-button" data-close="createDialog">×</button>
+      </div>
+      <div class="form-grid">
+        <div class="group-label"><span>基础信息</span></div>
+        <label class="field full"><span>环境名称</span><input name="name" maxlength="80" required placeholder="例如：landing-page-experiment" /></label>
+        <div class="field full"><span>环境模板</span><div id="templatePicker" class="template-picker"></div><input type="hidden" name="template_id" id="templateId" required /></div>
+        <div class="group-label"><span>首个会话与账号</span><small>进入工作台后可随时新增更多 Session</small></div>
+        <label class="field"><span>首个会话</span><select id="createAgentInput" name="agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="pi">Pi Agent</option><option value="opencode">OpenCode</option><option value="shell">Shell</option></select></label>
+        <div class="field account-selector-field"><span>账号配置</span><div class="field-action-row"><select id="createAccountInput" name="account_id"></select><button id="createAddAccountButton" type="button" class="button ghost small">添加账号</button></div><small id="createAccountHelp">Codex / Claude 的官方 CLI 登录由“账号与 Provider”统一管理。</small></div>
+        <div id="createPermissionFields" class="direct-config-panel full hidden">
+          <div class="direct-config-head"><div><div class="eyebrow">权限策略</div><h4>Claude Code 权限</h4></div><span class="direct-badge">默认安全</span></div>
+          <label class="field"><span>Permission mode</span><select id="createPermissionMode" name="permission_mode"><option value="manual">manual</option><option value="acceptEdits">acceptEdits</option><option value="auto">auto</option><option value="dontAsk">dontAsk</option><option value="plan">plan</option></select></label>
+          <small>跳过全部权限检查始终默认关闭。创建完成后，可在 Session 设置中输入 Workspace ID 单独开启。</small>
+        </div>
+        <div id="createDirectFields" class="direct-config-panel full hidden">
+          <div class="direct-config-head"><div><div class="eyebrow">Provider 配置</div><h4><span id="createDirectAgentName">Agent</span> 独立接入</h4></div><span class="direct-badge">仅此 Session</span></div>
+          <div class="form-grid compact-grid">
+            <label class="field"><span>Provider ID</span><input id="createDirectProvider" placeholder="例如：openrouter / anthropic / company-relay" /></label>
+            <label class="field"><span>模型</span><input id="createDirectModel" placeholder="例如：gpt-5.4 / claude-sonnet-4-5" /></label>
+            <label class="field full"><span>Base URL</span><input id="createDirectBaseURL" type="url" placeholder="https://api.example.com/v1" /></label>
+            <label class="field"><span>API 协议</span><select id="createDirectProtocol"><option value="openai-completions">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+            <label class="field"><span>API Key / Token</span><input id="createDirectSecret" type="password" autocomplete="new-password" placeholder="仅绑定当前 Session" /></label>
+            <label id="createDirectThinkingRow" class="field"><span>Pi Thinking</span><select id="createDirectThinking"><option value="">默认</option><option value="off">off</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></label>
+            <label class="check-row direct-check"><input id="createDirectAutoApprove" type="checkbox" /> 自动批准（仅 Pi/OpenCode；默认关闭）</label>
+          </div>
+          <small>参数只属于这个 Session。密钥加密保存，不会出现在统一账号列表中。</small>
+        </div>
+        <div class="group-label"><span>资源与来源</span></div>
+        <label class="field full"><span>Git 仓库（可选）</span><input name="git_url" placeholder="https://github.com/user/repo.git" /></label>
+        <label class="field"><span>CPU</span><select name="cpus"><option value="1">1 vCPU</option><option value="2" selected>2 vCPU</option><option value="4">4 vCPU</option><option value="8">8 vCPU</option></select></label>
+        <label class="field"><span>内存</span><select name="memory_mb"><option value="2048">2 GB</option><option value="4096" selected>4 GB</option><option value="8192">8 GB</option><option value="16384">16 GB</option></select></label>
+      </div>
+      <label class="dropzone" id="dropzone"><input id="fileInput" name="files" type="file" multiple /><span class="drop-icon">⇧</span><strong>拖入 ZIP 或多个文件</strong><small id="fileHint">也可以点击选择；Git 与上传文件可同时使用。</small></label>
+      <details class="advanced"><summary>Workspace 环境变量</summary><label class="field"><span>每行一个 KEY=VALUE</span><textarea name="environment" rows="5" placeholder="DATABASE_URL=...&#10;FEATURE_FLAG=true"></textarea><small>模型凭据建议通过“账号与 API”统一管理；这里适合项目自己的环境变量。</small></label></details>
+      <div id="createError" class="error-box hidden"></div>
+      <div class="dialog-actions"><button type="button" class="button subtle" data-close="createDialog">取消</button><button type="submit" class="button primary" id="createButton">创建并启动</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="sessionDialog" class="modal small-modal">
+    <form id="sessionForm">
+      <div class="dialog-header"><div><div class="eyebrow" id="sessionDialogEyebrow">NEW SESSION</div><h3 id="sessionDialogTitle">创建会话</h3><p>每个会话拥有独立的 tmux 与 Web Terminal。</p></div><button type="button" class="icon-button" data-close="sessionDialog">×</button></div>
+      <label class="field"><span>会话名称</span><input id="sessionNameInput" name="name" maxlength="80" placeholder="例如：修复登录问题" /></label>
+      <label class="field"><span>运行工具</span><select id="sessionAgentInput" name="agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="pi">Pi Agent</option><option value="opencode">OpenCode</option><option value="shell">Shell</option></select></label>
+      <div class="field account-selector-field"><span>账号配置</span><div class="field-action-row"><select id="sessionAccountInput" name="account_id"></select><button id="sessionAddAccountButton" type="button" class="button ghost small">添加账号</button></div><small id="sessionAccountHelp">每个 Session 可独立选择账号；原生登录由“账号与 Provider”统一管理。</small></div>
+      <div id="sessionLoginGuide" class="login-guide hidden" aria-live="polite"></div>
+      <div id="sessionPermissionFields" class="direct-config-panel hidden">
+        <div class="direct-config-head"><div><div class="eyebrow">权限策略</div><h4>Claude Code 权限</h4></div><span class="direct-badge">默认安全</span></div>
+        <label class="field"><span>Permission mode</span><select id="sessionPermissionMode"><option value="manual">manual</option><option value="acceptEdits">acceptEdits</option><option value="auto">auto</option><option value="dontAsk">dontAsk</option><option value="plan">plan</option></select></label>
+        <label class="check-row direct-check"><input id="sessionDangerousSkip" type="checkbox" /> 跳过全部权限检查（高风险）</label>
+        <label id="sessionDangerousConfirmRow" class="field hidden"><span>输入 Workspace ID 确认</span><input id="sessionDangerousConfirmation" autocomplete="off" /></label>
+        <small>危险模式仅应在无敏感凭据、无不受控网络的隔离容器中使用。</small>
+      </div>
+      <div id="sessionDirectFields" class="direct-config-panel hidden">
+        <div class="direct-config-head"><div><div class="eyebrow">Provider 配置</div><h4><span id="sessionDirectAgentName">Agent</span> 独立接入</h4></div><span class="direct-badge">仅此 Session</span></div>
+        <div class="form-grid compact-grid">
+          <label class="field"><span>Provider ID</span><input id="sessionDirectProvider" placeholder="例如：openrouter / anthropic / company-relay" /></label>
+          <label class="field"><span>模型</span><input id="sessionDirectModel" placeholder="例如：gpt-5.4 / claude-sonnet-4-5" /></label>
+          <label class="field full"><span>Base URL</span><input id="sessionDirectBaseURL" type="url" placeholder="https://api.example.com/v1" /></label>
+          <label class="field"><span>API 协议</span><select id="sessionDirectProtocol"><option value="openai-completions">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic-messages">Anthropic Messages</option></select></label>
+          <label class="field"><span>API Key / Token</span><input id="sessionDirectSecret" type="password" autocomplete="new-password" placeholder="仅绑定当前 Session" /></label>
+          <label id="sessionDirectThinkingRow" class="field"><span>Pi Thinking</span><select id="sessionDirectThinking"><option value="">默认</option><option value="off">off</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></label>
+          <label class="check-row direct-check"><input id="sessionDirectAutoApprove" type="checkbox" /> 自动批准（仅 Pi/OpenCode；默认关闭）</label>
+          <label id="sessionDirectClearRow" class="check-row direct-check hidden"><input id="sessionDirectClearSecret" type="checkbox" /> 清除已保存的 API Key</label>
+        </div>
+        <small>Pi/OpenCode 不使用统一账号；这组参数仅绑定当前 Session。</small>
+      </div>
+      <div id="sessionError" class="error-box hidden"></div>
+      <div class="dialog-actions"><button type="button" id="deleteSessionButton" class="button danger hidden">删除会话</button><span class="dialog-spacer"></span><button type="button" class="button subtle" data-close="sessionDialog">取消</button><button type="submit" class="button primary" id="saveSessionButton">创建会话</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="uploadDialog" class="modal small-modal">
+    <form id="uploadForm" enctype="multipart/form-data">
+      <div class="dialog-header"><div><div class="eyebrow">IMPORT FILES</div><h3>导入到当前环境</h3><p>ZIP 会安全解压并覆盖到 <code>/workspace</code>。</p></div><button type="button" class="icon-button" data-close="uploadDialog">×</button></div>
+      <label class="dropzone compact"><input id="workspaceFileInput" name="files" type="file" multiple /><span class="drop-icon">⇧</span><strong>选择 ZIP 或文件</strong><small id="workspaceFileHint">文件会覆盖同名路径。</small></label>
+      <div id="uploadError" class="error-box hidden"></div>
+      <div class="dialog-actions"><button type="button" class="button subtle" data-close="uploadDialog">取消</button><button type="submit" class="button primary" id="uploadButton">开始导入</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="previewDialog" class="modal small-modal">
+    <form id="previewForm">
+      <div class="dialog-header"><div><div class="eyebrow">PORT PREVIEW</div><h3>打开开发服务</h3><p>通过 8787 反向代理容器内端口。</p></div><button type="button" class="icon-button" data-close="previewDialog">×</button></div>
+      <label class="field"><span>容器端口</span><input id="previewPortInput" type="number" min="1" max="65535" value="3000" required /></label>
+      <div class="dialog-actions"><button type="button" class="button subtle" data-close="previewDialog">取消</button><button type="submit" class="button primary">在工作台打开</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="settingsDialog" class="modal small-modal">
+    <div id="settingsContent"></div>
+  </dialog>
+
+  <dialog id="transcriptDialog" class="modal transcript-modal">
+    <div class="dialog-header transcript-header"><div><div class="eyebrow">SESSION OUTPUT</div><h3 id="transcriptTitle">最近输出</h3></div><button type="button" class="icon-button" data-close="transcriptDialog">×</button></div>
+    <pre id="transcriptContent">Loading...</pre>
+  </dialog>
+
+  <dialog id="accountsDialog" class="modal accounts-modal">
+    <div class="accounts-shell">
+      <div class="dialog-header">
+        <div><div class="eyebrow">账号与 Provider</div><h3>Agent 登录配置</h3><p>Codex / Claude 使用托管账号或官方 CLI 登录；Pi / OpenCode 在各自 Session 中配置 Provider。</p></div>
+        <button type="button" class="icon-button" data-close="accountsDialog">×</button>
+      </div>
+      <div id="accountAuthWarning" class="control-auth-warning hidden" role="alert">
+        <strong>控制面认证未启用</strong>
+        <span>仅应在可信网络中使用；任何能访问此控制面的人都可能启动登录或删除本地凭据。</span>
+      </div>
+      <section class="provider-login-panel" aria-labelledby="providerLoginTitle">
+        <div class="provider-login-copy"><div class="eyebrow">官方账号登录</div><h4 id="providerLoginTitle">直接登录 Provider</h4><p>登录由 Provider 官方 CLI 与官方页面完成。VibeDock 不接收 Provider 密码，也不会把 setup-token 当作网页登录。</p></div>
+        <div class="provider-login-actions">
+          <button id="loginCodexTop" class="button provider-login-button codex" type="button"><span aria-hidden="true">C</span><b>使用 ChatGPT 登录 Codex</b></button>
+          <button id="loginClaudeTop" class="button provider-login-button claude" type="button"><span aria-hidden="true">A</span><b>使用 Claude.ai 登录 Claude</b></button>
+        </div>
+      </section>
+      <div class="accounts-toolbar">
+        <div class="account-security-note"><span aria-hidden="true">◇</span><div><b>凭据按认证方式隔离</b><small>API 密钥由控制面加密保存；原生 CLI 登录文件由官方 CLI 管理，并保存在共享凭据卷中。</small></div></div>
+        <button id="newAccountButton" class="button primary">＋ 添加账号</button>
+      </div>
+      <div class="account-onboarding">
+        <div><b>Codex / Claude 官方登录</b><small>创建原生登录账号后，可在这里登录、继续、取消、重新登录或退出登录。状态只以官方 CLI 检查结果为准。</small></div>
+        <div><b>Pi / OpenCode</b><small>它们没有统一账号对象。请在新建或编辑 Session 时填写 Provider、模型、协议与加密密钥。</small></div>
+      </div>
+      <div id="accountList" class="account-grid"></div>
+      <div id="accountEmpty" class="empty-state account-empty hidden"><div class="empty-orbit"><span>◎</span></div><h3>还没有账号配置</h3><p>添加一个原生登录档案，或配置 OpenAI / Anthropic 兼容 API。</p><button class="button primary" id="emptyAddAccount">添加第一个账号</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="accountDialog" class="modal wide-modal">
+    <form id="accountForm">
+      <div class="dialog-header">
+        <div><div class="eyebrow" id="accountDialogEyebrow">账号配置</div><h3 id="accountDialogTitle">添加账号配置</h3><p>Codex / Claude 配置可被多个 Workspace 和 Session 复用。</p></div>
+        <button type="button" class="icon-button" data-close="accountDialog">×</button>
+      </div>
+      <div class="form-grid">
+        <label class="field full"><span>显示名称</span><input id="accountNameInput" maxlength="80" required placeholder="例如：OpenAI Team / Claude 中转站" /></label>
+        <label class="field"><span>Agent</span><select id="accountAgentInput"><option value="codex">Codex</option><option value="claude">Claude Code</option></select></label>
+        <div class="field full"><span>认证方式</span><div id="accountAuthPicker" class="auth-method-picker" role="radiogroup" aria-label="选择认证方式"></div><select id="accountAuthInput" class="visually-hidden" tabindex="-1" aria-hidden="true"></select><small id="accountAuthMethodHint">选择 Provider 官方 CLI 登录，或填写 API 凭据。</small></div>
+        <label class="field full"><span>Base URL（可选）</span><input id="accountBaseURLInput" type="url" placeholder="https://api.openai.com/v1" /><small id="accountBaseURLHint">留空使用官方默认端点。</small></label>
+        <label class="field"><span>默认模型（可选）</span><input id="accountModelInput" placeholder="例如：gpt-5.4 / claude-sonnet-4-5" /></label>
+        <label class="field" id="accountSecretField"><span id="accountSecretLabel">API Key / Token</span><input id="accountSecretInput" type="password" autocomplete="new-password" placeholder="粘贴密钥" /><small id="accountSecretHint">密钥仅会发送到当前 VibeDock 控制面。</small></label>
+        <label class="field full"><span>附加非敏感环境变量（可选）</span><textarea id="accountEnvInput" rows="5" placeholder="KEY=VALUE&#10;ANOTHER_OPTION=true"></textarea><small>最多 20 项。Token、Secret、Password 或 API Key 必须使用上方密钥字段，不能放在这里。</small></label>
+      </div>
+      <label id="clearSecretRow" class="check-row hidden"><input id="clearSecretInput" type="checkbox" /> 清除已经保存的密钥</label>
+      <div id="accountError" class="error-box hidden"></div>
+      <div class="dialog-actions"><button type="button" class="button subtle" data-close="accountDialog">取消</button><button type="submit" class="button primary" id="saveAccountButton">保存账号</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="codexLoginDialog" class="modal auth-login-modal" aria-labelledby="codexLoginTitle" aria-describedby="codexLoginDescription">
+    <div class="auth-dialog-shell">
+      <div class="dialog-header auth-dialog-header">
+        <div><div class="eyebrow">CODEX OFFICIAL LOGIN</div><h3 id="codexLoginTitle">OpenAI 官方设备登录</h3><p id="codexLoginDescription">在 OpenAI 官方页面输入下面的设备代码。VibeDock 不会把代码附加到 URL，也不会接收你的 ChatGPT 密码。</p></div>
+        <button id="closeCodexLogin" type="button" class="icon-button" aria-label="关闭 Codex 登录窗口">×</button>
+      </div>
+      <div class="auth-dialog-body">
+        <div class="auth-dialog-provider"><span class="session-agent codex" aria-hidden="true">C</span><div><b id="codexLoginAccountName">Codex</b><small>使用官方 codex app-server 设备登录流程</small></div></div>
+        <div id="codexAuthWarning" class="control-auth-warning compact hidden" role="alert"></div>
+        <div id="codexLoginError" class="auth-dialog-error hidden" role="alert"></div>
+        <section id="codexDeviceSection" class="device-code-panel" aria-label="OpenAI 设备代码">
+          <span>设备代码</span>
+          <code id="codexDeviceCode" class="device-code" tabindex="0" aria-label="OpenAI 设备代码">等待官方 CLI…</code>
+          <div class="device-code-actions">
+            <button id="copyCodexCode" type="button" class="button ghost">复制代码</button>
+            <button id="openCodexOfficialPage" type="button" class="button primary" disabled>打开 OpenAI 官方页面</button>
+          </div>
+        </section>
+        <div class="auth-progress-row"><div id="codexLoginStatus" class="auth-progress" role="status" aria-live="polite" aria-atomic="true">正在启动官方登录…</div><time id="codexLoginCountdown">--:--</time></div>
+      </div>
+      <div class="dialog-actions auth-dialog-actions"><button id="cancelCodexLogin" type="button" class="button danger">取消登录</button><span class="dialog-spacer"></span><button id="retryCodexLogin" type="button" class="button ghost hidden">重试</button><button id="doneCodexLogin" type="button" class="button primary">关闭</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="claudeLoginDialog" class="modal auth-login-modal claude-auth-modal" aria-labelledby="claudeLoginTitle" aria-describedby="claudeLoginDescription">
+    <div class="auth-dialog-shell">
+      <div class="dialog-header auth-dialog-header">
+        <div><div class="eyebrow">CLAUDE OFFICIAL LOGIN</div><h3 id="claudeLoginTitle">Claude Code 官方登录</h3><p id="claudeLoginDescription">下面是独立的官方 <code>claude auth login --claudeai</code> 终端，不是普通 Workspace 终端。请按提示打开 Anthropic 官方页面，并把官方授权响应粘贴回终端。</p></div>
+        <button id="closeClaudeLogin" type="button" class="icon-button" aria-label="关闭 Claude 登录窗口">×</button>
+      </div>
+      <div class="auth-dialog-body">
+        <div class="auth-dialog-provider"><span class="session-agent claude" aria-hidden="true">A</span><div><b id="claudeLoginAccountName">Claude Code</b><small>VibeDock 不接收 Claude.ai 密码，也不解析终端中的授权响应</small></div></div>
+        <div id="claudeAuthWarning" class="control-auth-warning compact hidden" role="alert"></div>
+        <ol class="auth-login-steps"><li>在终端复制或打开 Claude Code 显示的 Anthropic 官方链接。</li><li>在官方页面完成登录，将官方授权响应粘贴回这个终端。</li><li>等待官方 CLI 验证完成；关闭此窗口不会取消登录。</li></ol>
+        <div id="claudeLoginError" class="auth-dialog-error hidden" role="alert"></div>
+        <div class="auth-terminal-frame"><div id="claudeTerminalPlaceholder" class="auth-terminal-placeholder">正在准备 Claude Code 官方登录终端…</div><iframe id="claudeLoginTerminal" title="Claude Code 官方登录终端" referrerpolicy="no-referrer" allow="clipboard-read; clipboard-write" hidden></iframe></div>
+        <div class="auth-progress-row"><div id="claudeLoginStatus" class="auth-progress" role="status" aria-live="polite" aria-atomic="true">正在启动官方登录…</div><time id="claudeLoginCountdown">--:--</time></div>
+      </div>
+      <div class="dialog-actions auth-dialog-actions"><button id="cancelClaudeLogin" type="button" class="button danger">取消登录</button><span class="dialog-spacer"></span><button id="retryClaudeLogin" type="button" class="button ghost hidden">重试</button><button id="doneClaudeLogin" type="button" class="button primary">关闭</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="batchDeleteDialog" class="modal small-modal" aria-labelledby="batchDeleteTitle">
+    <form method="dialog" id="batchDeleteForm">
+      <div class="dialog-header"><div><div class="eyebrow">DANGER ZONE</div><h3 id="batchDeleteTitle">删除选中的 Workspace？</h3><p id="batchDeleteDescription">此操作不可撤销。</p></div><button type="button" class="icon-button" data-close="batchDeleteDialog" aria-label="关闭">×</button></div>
+      <div id="batchDeleteList" class="batch-delete-list"></div>
+      <div class="dialog-actions"><button type="button" class="button subtle" data-close="batchDeleteDialog">取消</button><span class="dialog-spacer"></span><button id="confirmBatchDelete" type="submit" class="button danger">永久删除</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+  <script src="/account-auth.js" defer></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

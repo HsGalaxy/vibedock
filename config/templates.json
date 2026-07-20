@@ -1,0 +1,26 @@
+[
+  {
+    "id": "web-node22",
+    "name": "Node 22 Web",
+    "description": "Node.js 22、Python、常用构建工具与浏览器 IDE。",
+    "image": "vibedock/workspace:local",
+    "tags": ["node", "web", "typescript"],
+    "icon": "◆"
+  },
+  {
+    "id": "python-lab",
+    "name": "Python Lab",
+    "description": "Python、venv、pip 与完整 Linux 工具链。",
+    "image": "vibedock/workspace:local",
+    "tags": ["python", "data", "api"],
+    "icon": "⌘"
+  },
+  {
+    "id": "blank-linux",
+    "name": "Blank Linux",
+    "description": "不预设项目结构，从一个干净 Workspace 开始。",
+    "image": "vibedock/workspace:local",
+    "tags": ["linux", "shell"],
+    "icon": "▣"
+  }
+]

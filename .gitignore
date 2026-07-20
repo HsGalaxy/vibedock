@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+*.log
+.DS_Store
+/server
+.research-cache/
+**/__pycache__/
+*.py[cod]
+node_modules/
+coverage/

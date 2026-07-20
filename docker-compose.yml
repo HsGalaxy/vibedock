@@ -1,0 +1,29 @@
+services:
+  vibedock:
+    build: .
+    container_name: vibedock
+    restart: unless-stopped
+    ports:
+      - "${VIBEDOCK_PORT:-8787}:8787"
+    environment:
+      VIBEDOCK_LISTEN: ":8787"
+      VIBEDOCK_STATE: "/data/workspaces.json"
+      VIBEDOCK_TEMPLATES: "/config/templates.json"
+      VIBEDOCK_DOCKER_NETWORK: "${VIBEDOCK_DOCKER_NETWORK:-vibedock}"
+      VIBEDOCK_ADMIN_USER: "${VIBEDOCK_ADMIN_USER:-vibe}"
+      VIBEDOCK_ADMIN_PASSWORD: "${VIBEDOCK_ADMIN_PASSWORD:-}"
+      VIBEDOCK_CREDENTIAL_KEY_FILE: "/data/credential.key"
+      VIBEDOCK_CREDENTIAL_KEY: "${VIBEDOCK_CREDENTIAL_KEY:-}"
+      VIBEDOCK_AUTH_HELPER_IMAGE: "${VIBEDOCK_AUTH_HELPER_IMAGE:-vibedock/workspace:local}"
+      VIBEDOCK_LOGIN_TTL: "${VIBEDOCK_LOGIN_TTL:-15m}"
+      VIBEDOCK_MAX_LOGIN_HELPERS: "${VIBEDOCK_MAX_LOGIN_HELPERS:-3}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+      - ./config:/config:ro
+    networks:
+      - vibedock
+
+networks:
+  vibedock:
+    name: "${VIBEDOCK_DOCKER_NETWORK:-vibedock}"
