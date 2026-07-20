@@ -168,6 +168,20 @@ class StateAndTransactionTest(RootCase):
         self.assertFalse(item["marker"].exists())
         self.assertFalse(item["previous"].exists())
 
+    def test_remove_tree_unlinks_nested_symlinks_without_following(self):
+        item = self._create_stage()
+        temporary = item["stage"] / "tmp" / "arg0"
+        helper._mkdir_secure(self.root, temporary)
+        outside = self.root.parent / "outside-auth-remove-test"
+        outside.write_text("outside", encoding="utf-8")
+        (temporary / "codex").symlink_to(outside)
+        try:
+            self.assertTrue(helper._remove_tree(self.root, item["stage"] / "tmp"))
+            self.assertFalse((item["stage"] / "tmp").exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        finally:
+            outside.unlink(missing_ok=True)
+
     def test_recover_restores_old_profile_before_install(self):
         item = self._create_stage()
         helper._mkdir_secure(self.root, item["previous"])

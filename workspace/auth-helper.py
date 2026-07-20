@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -180,18 +179,47 @@ def _assert_tree_safe(root: Path, path: Path) -> None:
                 raise HelperError("unsafe_credentials_path")
 
 
+def _remove_entry_at(parent: int, name: str) -> None:
+    """Remove an entry without following symlinks, anchored to its parent fd."""
+    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if stat.S_ISDIR(info.st_mode):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        child = os.open(name, flags, dir_fd=parent)
+        try:
+            for child_name in os.listdir(child):
+                _remove_entry_at(child, child_name)
+        finally:
+            os.close(child)
+        os.rmdir(name, dir_fd=parent)
+    else:
+        os.unlink(name, dir_fd=parent)
+
+
 def _remove_tree(root: Path, path: Path) -> bool:
+    """Remove a tree safely, unlinking provider-created symlinks in place."""
     _assert_components(root, path, allow_leaf_symlink=True)
+    relative = path.relative_to(root)
+    if not relative.parts:
+        raise HelperError("unsafe_credentials_path")
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_fd = root_fd
+    opened: list[int] = []
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return False
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        os.unlink(path)
+        for component in relative.parts[:-1]:
+            child_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            opened.append(child_fd)
+            parent_fd = child_fd
+        leaf = relative.parts[-1]
+        try:
+            os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        _remove_entry_at(parent_fd, leaf)
         return True
-    _assert_tree_safe(root, path)
-    shutil.rmtree(path)
-    return True
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        os.close(root_fd)
 
 
 def _atomic_json(root: Path, path: Path, value: dict[str, Any]) -> None:
@@ -798,6 +826,16 @@ def login_codex(root: Path, account: str, attempt: str, expiry: int) -> int:
         verified = rpc.request("account/read", {"refreshToken": False}, time.monotonic() + 15)
         if not validate_account_result(verified):
             raise HelperError("provider_verification_failed")
+        # Codex creates executable symlinks under its temporary argument
+        # directory while the app-server is running. Stop it before the
+        # profile safety check and discard those runtime-only artifacts.
+        rpc.close()
+        rpc = None
+        terminate_process(process)
+        process = None
+        for temporary in (item["stage"] / "tmp", item["stage"] / ".tmp"):
+            if temporary.exists() or temporary.is_symlink():
+                _remove_tree(root, temporary)
         commit_staging(root, item, "codex")
         update_state(root, item["state"], state, "completed", error_code="")
         return 0
