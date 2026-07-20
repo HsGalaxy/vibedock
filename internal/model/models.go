@@ -14,6 +14,27 @@ type Template struct {
 	Icon        string   `json:"icon,omitempty"`
 }
 
+// EnvironmentProfile is a reusable, standardized customization layered on a
+// built-in Workspace template. It intentionally cannot select an arbitrary
+// image or Dockerfile, so every resulting Workspace keeps VibeDock's runtime
+// contract.
+type EnvironmentProfile struct {
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Description    string            `json:"description,omitempty"`
+	Icon           string            `json:"icon,omitempty"`
+	BaseTemplateID string            `json:"base_template_id"`
+	CPUs           float64           `json:"cpus"`
+	MemoryMB       int               `json:"memory_mb"`
+	AptPackages    []string          `json:"apt_packages,omitempty"`
+	NPMModules     []string          `json:"npm_modules,omitempty"`
+	PythonPackages []string          `json:"python_packages,omitempty"`
+	Environment    map[string]string `json:"environment,omitempty"`
+	InitScript     string            `json:"init_script,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
+}
+
 type Session struct {
 	ID                       string              `json:"id"`
 	Name                     string              `json:"name"`
@@ -75,15 +96,17 @@ type Workspace struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 	// Password is an internal credential used only for ttyd. It is retained for
 	// backward compatibility with existing state files and is never serialized.
-	Password           string    `json:"-"`
-	LegacyPassword     string    `json:"password,omitempty"`
-	PasswordCiphertext string    `json:"password_ciphertext,omitempty"`
-	PasswordHint       string    `json:"password_hint,omitempty"`
-	CPUs               float64   `json:"cpus"`
-	MemoryMB           int       `json:"memory_mb"`
-	EnvKeys            []string  `json:"env_keys,omitempty"`
-	Sessions           []Session `json:"sessions,omitempty"`
-	Error              string    `json:"error,omitempty"`
+	Password               string    `json:"-"`
+	LegacyPassword         string    `json:"password,omitempty"`
+	PasswordCiphertext     string    `json:"password_ciphertext,omitempty"`
+	PasswordHint           string    `json:"password_hint,omitempty"`
+	CPUs                   float64   `json:"cpus"`
+	MemoryMB               int       `json:"memory_mb"`
+	EnvKeys                []string  `json:"env_keys,omitempty"`
+	EnvironmentProfileID   string    `json:"environment_profile_id,omitempty"`
+	EnvironmentProfileName string    `json:"environment_profile_name,omitempty"`
+	Sessions               []Session `json:"sessions,omitempty"`
+	Error                  string    `json:"error,omitempty"`
 
 	// Legacy fields are retained only so state files from the first MVP can be
 	// loaded and migrated. New code does not write or expose host port mappings.
@@ -153,6 +176,19 @@ type CreateRuntimeRequest struct {
 	CPUs          float64
 	MemoryMB      int
 	Environment   map[string]string
+}
+
+type EnvironmentSetup struct {
+	AptPackages    []string
+	NPMModules     []string
+	PythonPackages []string
+	InitScript     string
+}
+
+// EnvironmentRuntime is optional so alternate Runtime implementations keep
+// working when no custom environment setup is requested.
+type EnvironmentRuntime interface {
+	InitializeEnvironment(Context, string, EnvironmentSetup) error
 }
 
 type SessionRuntimeRequest struct {

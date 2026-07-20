@@ -42,6 +42,10 @@ type fakeRuntime struct {
 	stats           model.RuntimeResourceStats
 	statsErr        error
 	statsTarget     string
+	lastCreate      model.CreateRuntimeRequest
+	lastSetup       model.EnvironmentSetup
+	initialized     bool
+	initializeErr   error
 	ensureErr       error
 	ensureStarted   chan struct{}
 	ensureRelease   chan struct{}
@@ -49,9 +53,15 @@ type fakeRuntime struct {
 	ensureCallCount int
 }
 
-func (f *fakeRuntime) Create(context.Context, model.CreateRuntimeRequest) (model.RuntimeInfo, error) {
+func (f *fakeRuntime) Create(_ context.Context, req model.CreateRuntimeRequest) (model.RuntimeInfo, error) {
 	f.created = true
+	f.lastCreate = req
 	return model.RuntimeInfo{Status: "running"}, nil
+}
+func (f *fakeRuntime) InitializeEnvironment(_ context.Context, _ string, setup model.EnvironmentSetup) error {
+	f.initialized = true
+	f.lastSetup = setup
+	return f.initializeErr
 }
 func (f *fakeRuntime) Start(context.Context, string) (model.RuntimeInfo, error) {
 	return model.RuntimeInfo{Status: "running"}, nil

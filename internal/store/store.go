@@ -17,13 +17,15 @@ type Store struct {
 	path           string
 	workspaces     map[string]model.Workspace
 	accounts       map[string]model.AccountProfile
+	environments   map[string]model.EnvironmentProfile
 	sessionSecrets map[string]string
 }
 
 type diskState struct {
-	Workspaces     []model.Workspace      `json:"workspaces"`
-	Accounts       []model.AccountProfile `json:"accounts,omitempty"`
-	SessionSecrets map[string]string      `json:"session_secrets,omitempty"`
+	Workspaces     []model.Workspace          `json:"workspaces"`
+	Accounts       []model.AccountProfile     `json:"accounts,omitempty"`
+	Environments   []model.EnvironmentProfile `json:"environment_profiles,omitempty"`
+	SessionSecrets map[string]string          `json:"session_secrets,omitempty"`
 }
 
 func New(path string) (*Store, error) {
@@ -31,6 +33,7 @@ func New(path string) (*Store, error) {
 		path:           path,
 		workspaces:     make(map[string]model.Workspace),
 		accounts:       make(map[string]model.AccountProfile),
+		environments:   make(map[string]model.EnvironmentProfile),
 		sessionSecrets: make(map[string]string),
 	}
 	if err := s.load(); err != nil {
@@ -59,6 +62,9 @@ func (s *Store) load() error {
 	}
 	for _, account := range state.Accounts {
 		s.accounts[account.ID] = account
+	}
+	for _, environment := range state.Environments {
+		s.environments[environment.ID] = cloneEnvironment(environment)
 	}
 	for sessionID, ciphertext := range state.SessionSecrets {
 		s.sessionSecrets[sessionID] = ciphertext
@@ -137,6 +143,43 @@ func (s *Store) DeleteAccount(id string) error {
 	return s.saveLocked()
 }
 
+func (s *Store) ListEnvironmentProfiles() []model.EnvironmentProfile {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]model.EnvironmentProfile, 0, len(s.environments))
+	for _, environment := range s.environments {
+		out = append(out, cloneEnvironment(environment))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+func (s *Store) GetEnvironmentProfile(id string) (model.EnvironmentProfile, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	environment, ok := s.environments[id]
+	return cloneEnvironment(environment), ok
+}
+
+func (s *Store) PutEnvironmentProfile(environment model.EnvironmentProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.environments[environment.ID] = cloneEnvironment(environment)
+	return s.saveLocked()
+}
+
+func (s *Store) DeleteEnvironmentProfile(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.environments, id)
+	return s.saveLocked()
+}
+
 func (s *Store) GetSessionSecret(sessionID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -169,6 +212,7 @@ func (s *Store) saveLocked() error {
 	state := diskState{
 		Workspaces:     make([]model.Workspace, 0, len(s.workspaces)),
 		Accounts:       make([]model.AccountProfile, 0, len(s.accounts)),
+		Environments:   make([]model.EnvironmentProfile, 0, len(s.environments)),
 		SessionSecrets: make(map[string]string, len(s.sessionSecrets)),
 	}
 	for _, ws := range s.workspaces {
@@ -176,6 +220,9 @@ func (s *Store) saveLocked() error {
 	}
 	for _, account := range s.accounts {
 		state.Accounts = append(state.Accounts, cloneAccount(account))
+	}
+	for _, environment := range s.environments {
+		state.Environments = append(state.Environments, cloneEnvironment(environment))
 	}
 	for sessionID, ciphertext := range s.sessionSecrets {
 		state.SessionSecrets[sessionID] = ciphertext
@@ -185,6 +232,9 @@ func (s *Store) saveLocked() error {
 	})
 	sort.Slice(state.Accounts, func(i, j int) bool {
 		return state.Accounts[i].CreatedAt.Before(state.Accounts[j].CreatedAt)
+	})
+	sort.Slice(state.Environments, func(i, j int) bool {
+		return state.Environments[i].CreatedAt.Before(state.Environments[j].CreatedAt)
 	})
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -210,6 +260,20 @@ func cloneWorkspace(ws model.Workspace) model.Workspace {
 		}
 	}
 	return ws
+}
+
+func cloneEnvironment(environment model.EnvironmentProfile) model.EnvironmentProfile {
+	environment.AptPackages = append([]string(nil), environment.AptPackages...)
+	environment.NPMModules = append([]string(nil), environment.NPMModules...)
+	environment.PythonPackages = append([]string(nil), environment.PythonPackages...)
+	if environment.Environment != nil {
+		cloned := make(map[string]string, len(environment.Environment))
+		for key, value := range environment.Environment {
+			cloned[key] = value
+		}
+		environment.Environment = cloned
+	}
+	return environment
 }
 
 func cloneAccount(account model.AccountProfile) model.AccountProfile {

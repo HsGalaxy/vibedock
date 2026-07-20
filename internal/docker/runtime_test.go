@@ -33,6 +33,27 @@ func TestRuntimeDefaults(t *testing.T) {
 	}
 }
 
+func TestEnvironmentSetupScriptUsesQuotedPackagesAndStandardPaths(t *testing.T) {
+	script := environmentSetupScript(model.EnvironmentSetup{
+		AptPackages: []string{"ripgrep", "python3-venv"}, NPMModules: []string{"typescript@5"},
+		PythonPackages: []string{"httpx==0.28.1"}, InitScript: "printf '%s\\n' ready",
+	})
+	for _, expected := range []string{
+		"/usr/bin/apt-get install -y --no-install-recommends -- 'ripgrep' 'python3-venv'",
+		"/usr/bin/npm install --global --no-audit --no-fund -- 'typescript@5'",
+		"/home/coder/.venvs/vibedock/bin/pip install --disable-pip-version-check -- 'httpx==0.28.1'",
+		"/usr/sbin/gosu coder",
+		"/usr/bin/base64 -d",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("environment setup script missing %q: %s", expected, script)
+		}
+	}
+	if strings.Contains(script, "docker run") {
+		t.Fatal("environment setup must execute inside the workspace")
+	}
+}
+
 func TestParseDockerStats(t *testing.T) {
 	stats, err := parseDockerStats(`{"CPUPerc":"125.25%","MemPerc":"12.50%","MemUsage":"512MiB / 4GiB","PIDs":"24"}`)
 	if err != nil {

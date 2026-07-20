@@ -3,8 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <meta name="theme-color" content="#07090d" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#0d1117" />
+  <script>
+    (() => {
+      let stored = '';
+      try { stored = localStorage.getItem('vibedock-theme') || ''; } catch (_) {}
+      const theme = stored === 'light' || stored === 'dark'
+        ? stored
+        : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <title>VibeDock 0.5</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -17,6 +27,8 @@
       </button>
       <div class="dashboard-actions">
         <span id="healthBadge" class="health-badge"><i></i> 控制面正常</span>
+        <button class="icon-button" data-theme-toggle title="切换明暗主题" aria-label="切换明暗主题">☼</button>
+        <button id="openEnvironmentProfiles" class="button ghost">定制环境</button>
         <button id="openAccounts" class="button ghost">账号与 Provider</button>
         <button id="refreshButton" class="icon-button" title="刷新 Workspace 列表" aria-label="刷新 Workspace 列表">↻</button>
       </div>
@@ -25,12 +37,35 @@
     <main class="shell-width dashboard-main">
       <section class="dashboard-summary">
         <div>
-          <h1>Workspaces</h1>
-          <p>管理持久化 Docker 开发环境、运行状态、资源配额和 Agent 会话。</p>
+          <h1>工作台概览</h1>
+          <p>从这里恢复项目、检查运行状态，或快速创建一个标准化开发环境。</p>
         </div>
         <div class="launch-actions">
           <button class="button ghost" id="quickImportButton">从 ZIP / 文件创建</button>
           <button class="button primary" data-create>新建 Workspace</button>
+        </div>
+      </section>
+
+      <section class="overview-metrics" aria-label="运行概览">
+        <button class="overview-metric" data-home-filter="all"><span>Workspace</span><strong id="overviewWorkspaceCount">—</strong><small>全部环境</small></button>
+        <button class="overview-metric" data-home-filter="running"><span>运行中</span><strong id="overviewRunningCount">—</strong><small>可立即进入</small></button>
+        <div class="overview-metric"><span>活跃 Session</span><strong id="overviewSessionCount">—</strong><small>正在提供终端</small></div>
+        <div class="overview-metric"><span>需要处理</span><strong id="overviewIssueCount">—</strong><small id="overviewIssueHint">状态正常</small></div>
+      </section>
+
+      <section class="home-overview-grid">
+        <div class="home-panel">
+          <div class="home-panel-heading"><div><h2>最近会话</h2><p>从最近一次工作继续。</p></div><button class="button subtle small" data-home-filter="all">查看全部</button></div>
+          <div id="recentSessionList" class="operation-list"></div>
+        </div>
+        <div class="home-panel">
+          <div class="home-panel-heading"><div><h2>快捷操作</h2><p>常用管理入口。</p></div></div>
+          <div class="quick-action-list">
+            <button class="quick-action" data-create><span>＋</span><div><b>新建 Workspace</b><small>从固定模板或定制环境开始</small></div></button>
+            <button class="quick-action" id="homeImportButton"><span>⇧</span><div><b>导入项目文件</b><small>ZIP 或多个文件直接进入 /workspace</small></div></button>
+            <button class="quick-action" data-open-environments><span>◇</span><div><b>管理定制环境</b><small>保存包、变量和初始化脚本</small></div></button>
+            <button class="quick-action" data-open-accounts><span>◎</span><div><b>账号与 Provider</b><small>检查 Codex、Claude 和 API 配置</small></div></button>
+          </div>
         </div>
       </section>
 
@@ -81,6 +116,7 @@
         <button id="commandButton" class="command-trigger"><span>搜索命令、会话和工具</span><kbd>⌘ K</kbd></button>
       </div>
       <div class="titlebar-actions">
+        <button class="icon-button compact" data-theme-toggle title="切换明暗主题" aria-label="切换明暗主题">☼</button>
         <button id="workspacePowerButton" class="icon-button compact" title="启动或停止环境">◉</button>
         <button id="workspaceSettingsButton" class="icon-button compact" title="Workspace 设置">⚙</button>
       </div>
@@ -185,7 +221,8 @@
       <div class="form-grid">
         <div class="group-label"><span>基础信息</span></div>
         <label class="field full"><span>环境名称</span><input name="name" maxlength="80" required placeholder="例如：landing-page-experiment" /></label>
-        <div class="field full"><span>环境模板</span><div id="templatePicker" class="template-picker"></div><input type="hidden" name="template_id" id="templateId" required /></div>
+        <div class="field full"><span>环境模板</span><div id="templatePicker" class="template-picker"></div><input type="hidden" name="template_id" id="templateId" required /><input type="hidden" name="environment_profile_id" id="environmentProfileId" /></div>
+        <div class="field full template-manage-row"><small>定制环境基于 VibeDock 标准镜像应用包和初始化脚本。</small><button type="button" class="button ghost small" id="createManageEnvironments">管理定制环境</button></div>
         <div class="group-label"><span>首个会话与账号</span><small>进入工作台后可随时新增更多 Session</small></div>
         <label class="field"><span>首个会话</span><select id="createAgentInput" name="agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="pi">Pi Agent</option><option value="opencode">OpenCode</option><option value="shell">Shell</option></select></label>
         <div class="field account-selector-field"><span>账号配置</span><div class="field-action-row"><select id="createAccountInput" name="account_id"></select><button id="createAddAccountButton" type="button" class="button ghost small">添加账号</button></div><small id="createAccountHelp">Codex / Claude 的官方 CLI 登录由“账号与 Provider”统一管理。</small></div>
@@ -217,6 +254,42 @@
       <div id="createError" class="error-box hidden"></div>
       <div class="dialog-actions"><button type="button" class="button subtle" data-close="createDialog">取消</button><button type="submit" class="button primary" id="createButton">创建并启动</button></div>
     </form>
+  </dialog>
+
+  <dialog id="environmentProfilesDialog" class="modal environment-modal">
+    <div class="environment-shell">
+      <div class="dialog-header">
+        <div><div class="eyebrow">ENVIRONMENT PROFILES</div><h3>定制环境</h3><p>保存一套可重复使用的工具链和初始化步骤。基础镜像由 VibeDock 管理。</p></div>
+        <button type="button" class="icon-button" data-close="environmentProfilesDialog">×</button>
+      </div>
+      <div class="environment-layout">
+        <aside class="environment-list-pane">
+          <button type="button" class="button primary" id="newEnvironmentProfile">＋ 新建配置</button>
+          <div id="environmentProfileList" class="environment-profile-list"></div>
+        </aside>
+        <form id="environmentProfileForm" class="environment-editor">
+          <input type="hidden" id="environmentEditingID" />
+          <div class="environment-editor-heading"><div><span class="eyebrow">PROFILE</span><h4 id="environmentEditorTitle">新建定制环境</h4></div><button type="button" class="button danger small hidden" id="deleteEnvironmentProfile">删除</button></div>
+          <div class="form-grid compact-grid">
+            <label class="field"><span>名称</span><input id="environmentName" maxlength="80" required placeholder="例如：前端工具链" /></label>
+            <label class="field"><span>图标</span><select id="environmentIcon"><option value="◇">◇ 工具</option><option value="◈">◈ 服务</option><option value="▣">▣ Linux</option><option value="⌘">⌘ 数据</option><option value="W">W Web</option></select></label>
+            <label class="field full"><span>描述</span><input id="environmentDescription" maxlength="240" placeholder="说明这套环境适合什么项目" /></label>
+            <label class="field"><span>基础模板</span><select id="environmentBaseTemplate"></select></label>
+            <label class="field"><span>默认 CPU</span><select id="environmentCPUs"><option value="1">1 vCPU</option><option value="2" selected>2 vCPU</option><option value="4">4 vCPU</option><option value="8">8 vCPU</option></select></label>
+            <label class="field"><span>默认内存</span><select id="environmentMemory"><option value="2048">2 GB</option><option value="4096" selected>4 GB</option><option value="8192">8 GB</option><option value="16384">16 GB</option></select></label>
+          </div>
+          <div class="environment-package-grid">
+            <label class="field"><span>APT 包</span><textarea id="environmentApt" rows="4" placeholder="每行一个，例如：ripgrep&#10;python3-venv"></textarea></label>
+            <label class="field"><span>npm 全局模块</span><textarea id="environmentNpm" rows="4" placeholder="每行一个，例如：typescript@5"></textarea></label>
+            <label class="field"><span>Python 包</span><textarea id="environmentPython" rows="4" placeholder="每行一个，例如：httpx==0.28.1"></textarea></label>
+          </div>
+          <label class="field"><span>非敏感环境变量</span><textarea id="environmentVariables" rows="4" placeholder="每行一个 KEY=VALUE&#10;APP_MODE=development"></textarea><small>敏感值请使用账号或 Session 的加密配置。</small></label>
+          <label class="field"><span>初始化脚本（可选）</span><textarea id="environmentInitScript" class="code-textarea" rows="7" placeholder="例如：&#10;npm install&#10;python -m venv .venv"></textarea><small>脚本会在项目导入后以 coder 身份从 /workspace 执行。</small></label>
+          <div id="environmentProfileError" class="error-box hidden"></div>
+          <div class="dialog-actions"><span class="dialog-spacer"></span><button type="button" class="button subtle" data-close="environmentProfilesDialog">关闭</button><button type="submit" class="button primary" id="saveEnvironmentProfile">保存配置</button></div>
+        </form>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="sessionDialog" class="modal wide-modal">

@@ -398,6 +398,57 @@ func (r *Runtime) ProxyTarget(ctx model.Context, containerName string, port int)
 	return "http://" + net.JoinHostPort(ip, strconv.Itoa(port)), nil
 }
 
+func (r *Runtime) InitializeEnvironment(ctx model.Context, containerName string, setup model.EnvironmentSetup) error {
+	if len(setup.AptPackages) == 0 && len(setup.NPMModules) == 0 && len(setup.PythonPackages) == 0 && strings.TrimSpace(setup.InitScript) == "" {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 15*time.Minute)
+	defer cancel()
+	_, err := r.runWithInput(cctx, environmentSetupScript(setup), "exec", "-i", containerName, "bash", "-s")
+	return err
+}
+
+func environmentSetupScript(setup model.EnvironmentSetup) string {
+	var script strings.Builder
+	script.WriteString("set -Eeuo pipefail\n")
+	if len(setup.AptPackages) > 0 {
+		script.WriteString("export DEBIAN_FRONTEND=noninteractive\n/usr/bin/apt-get update\n/usr/bin/apt-get install -y --no-install-recommends --")
+		for _, item := range setup.AptPackages {
+			script.WriteByte(' ')
+			script.WriteString(shellQuote(item))
+		}
+		script.WriteString("\n/usr/bin/rm -rf /var/lib/apt/lists/*\n")
+	}
+	if len(setup.NPMModules) > 0 {
+		script.WriteString("/usr/sbin/gosu coder /usr/bin/env HOME=/home/coder NPM_CONFIG_PREFIX=/home/coder/.local PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/npm install --global --no-audit --no-fund --")
+		for _, item := range setup.NPMModules {
+			script.WriteByte(' ')
+			script.WriteString(shellQuote(item))
+		}
+		script.WriteByte('\n')
+	}
+	if len(setup.PythonPackages) > 0 {
+		script.WriteString("/usr/bin/mkdir -p /home/coder/.venvs\n")
+		script.WriteString("if [[ ! -x /home/coder/.venvs/vibedock/bin/python ]]; then /usr/bin/python3 -m venv /home/coder/.venvs/vibedock; fi\n")
+		script.WriteString("/usr/bin/chown -R coder:coder /home/coder/.venvs\n")
+		script.WriteString("/usr/sbin/gosu coder /usr/bin/env HOME=/home/coder /home/coder/.venvs/vibedock/bin/pip install --disable-pip-version-check --")
+		for _, item := range setup.PythonPackages {
+			script.WriteByte(' ')
+			script.WriteString(shellQuote(item))
+		}
+		script.WriteByte('\n')
+		script.WriteString("if ! /usr/bin/grep -Fq '# VibeDock Python environment' /home/coder/.bashrc; then /usr/bin/printf '%s\\n' '# VibeDock Python environment' 'export PATH=\"$HOME/.venvs/vibedock/bin:$PATH\"' >>/home/coder/.bashrc; fi\n")
+		script.WriteString("/usr/bin/chown coder:coder /home/coder/.bashrc\n")
+	}
+	if strings.TrimSpace(setup.InitScript) != "" {
+		encoded := base64.StdEncoding.EncodeToString([]byte(setup.InitScript))
+		script.WriteString("cd /workspace\n/usr/bin/printf '%s' ")
+		script.WriteString(shellQuote(encoded))
+		script.WriteString(" | /usr/bin/base64 -d | /usr/sbin/gosu coder /usr/bin/env HOME=/home/coder USER=coder LOGNAME=coder NPM_CONFIG_PREFIX=/home/coder/.local PATH=/home/coder/.venvs/vibedock/bin:/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -se\n")
+	}
+	return script.String()
+}
+
 func (r *Runtime) EnsureSession(ctx model.Context, containerName string, req model.SessionRuntimeRequest) error {
 	cctx, cancel := context.WithTimeout(asContext(ctx), 30*time.Second)
 	defer cancel()

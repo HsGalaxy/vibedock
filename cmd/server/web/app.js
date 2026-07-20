@@ -1,8 +1,10 @@
 const state = {
   templates: [],
+  environmentProfiles: [],
   workspaces: [],
   accounts: [],
   selectedTemplate: null,
+  selectedEnvironmentProfile: null,
   filter: 'all',
   managementMode: false,
   selectedWorkspaceIDs: new Set(),
@@ -43,10 +45,29 @@ const transcriptDialog = $('#transcriptDialog');
 const accountsDialog = $('#accountsDialog');
 const accountDialog = $('#accountDialog');
 const accountConfigDialog = $('#accountConfigDialog');
+const environmentProfilesDialog = $('#environmentProfilesDialog');
 const codexLoginDialog = $('#codexLoginDialog');
 const claudeLoginDialog = $('#claudeLoginDialog');
 const accountAuth = globalThis.VibeDockAccountAuth;
 const AUTH_REQUEST_HEADER = 'X-VibeDock-Request';
+
+function applyTheme(theme, persist = true) {
+  const value = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = value;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', value === 'light' ? '#f6f8fa' : '#0d1117');
+  $$('[data-theme-toggle]').forEach(button => {
+    button.textContent = value === 'light' ? '☾' : '☼';
+    button.title = value === 'light' ? '切换到暗色模式' : '切换到亮色模式';
+    button.setAttribute('aria-label', button.title);
+  });
+  if (persist) {
+    try { localStorage.setItem('vibedock-theme', value); } catch (_) { /* browser storage may be disabled */ }
+  }
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+}
 
 async function api(path, options = {}) {
   const controller = new AbortController();
@@ -106,6 +127,9 @@ function workspaceRouteID() {
 }
 
 function templateFor(ws) {
+  const profile = state.environmentProfiles.find(item => item.id === ws.environment_profile_id);
+  if (profile) return {name: profile.name, icon: profile.icon || '◇'};
+  if (ws.environment_profile_name) return {name: ws.environment_profile_name, icon: '◇'};
   return state.templates.find(item => item.id === ws.template_id) || {name: ws.template_id, icon:'◆'};
 }
 
@@ -333,24 +357,62 @@ function scheduleLaunchPreview() {
 }
 
 /* Dashboard */
-function setTemplate(id) {
+function setTemplate(id, environmentProfileID = '') {
+  const changed = state.selectedTemplate !== id || state.selectedEnvironmentProfile !== (environmentProfileID || null);
   state.selectedTemplate = id;
+  state.selectedEnvironmentProfile = environmentProfileID || null;
   $('#templateId').value = id;
-  $$('.template-option').forEach(button => button.classList.toggle('selected', button.dataset.id === id));
+  $('#environmentProfileId').value = environmentProfileID;
+  $$('.template-option').forEach(button => button.classList.toggle('selected', button.dataset.id === id && (button.dataset.environmentProfile || '') === environmentProfileID));
+  const profile = state.environmentProfiles.find(item => item.id === environmentProfileID);
+  if (profile && changed) {
+    $('#createForm [name="cpus"]').value = String(profile.cpus);
+    $('#createForm [name="memory_mb"]').value = String(profile.memory_mb);
+  }
 }
 
 function renderTemplates() {
-  $('#templatePicker').innerHTML = state.templates.map(template => `
-    <button type="button" class="template-option" data-id="${escapeHTML(template.id)}">
+  const builtins = state.templates.map(template => ({...template, environmentProfile:''}));
+  const custom = state.environmentProfiles.map(profile => ({
+    id:profile.base_template_id, name:profile.name, description:profile.description || '定制环境配置', icon:profile.icon || '◇', environmentProfile:profile.id,
+  }));
+  $('#templatePicker').innerHTML = [...builtins, ...custom].map(template => `
+    <button type="button" class="template-option" data-id="${escapeHTML(template.id)}" data-environment-profile="${escapeHTML(template.environmentProfile)}">
       <strong>${escapeHTML(template.icon || '◆')} ${escapeHTML(template.name)}</strong>
-      <span>${escapeHTML(template.description)}</span>
+      <span>${escapeHTML(template.description)}${template.environmentProfile ? ' · 定制' : ''}</span>
     </button>`).join('');
-  $$('.template-option').forEach(button => button.onclick = () => setTemplate(button.dataset.id));
-  if (state.templates.length) setTemplate(state.templates.some(t => t.id === state.selectedTemplate) ? state.selectedTemplate : state.templates[0].id);
+  $$('.template-option').forEach(button => button.onclick = () => setTemplate(button.dataset.id, button.dataset.environmentProfile));
+  const selectedProfile = state.environmentProfiles.find(item => item.id === state.selectedEnvironmentProfile);
+  if (selectedProfile) setTemplate(selectedProfile.base_template_id, selectedProfile.id);
+  else if (state.templates.length) setTemplate(state.templates.some(t => t.id === state.selectedTemplate) ? state.selectedTemplate : state.templates[0].id);
 }
 
 function visibleWorkspaces() {
   return state.workspaces.filter(ws => state.filter === 'all' || (state.filter === 'running' ? ws.status === 'running' : ws.status !== 'running'));
+}
+
+function renderHomeOverview() {
+  const running = state.workspaces.filter(ws => ws.status === 'running');
+  const sessions = state.workspaces.flatMap(ws => (ws.sessions || []).map(session => ({workspace:ws, session})));
+  const active = sessions.filter(item => item.session.status === 'running').length;
+  const issues = state.workspaces.filter(ws => ['error', 'missing'].includes(ws.status)).length
+    + sessions.filter(item => item.session.status === 'error').length;
+  $('#overviewWorkspaceCount').textContent = String(state.workspaces.length);
+  $('#overviewRunningCount').textContent = String(running.length);
+  $('#overviewSessionCount').textContent = String(active);
+  $('#overviewIssueCount').textContent = String(issues);
+  $('#overviewIssueHint').textContent = issues ? '需要检查' : '状态正常';
+  const recent = sessions.sort((a, b) => new Date(b.session.updated_at || b.session.created_at || 0) - new Date(a.session.updated_at || a.session.created_at || 0)).slice(0, 6);
+  const list = $('#recentSessionList');
+  if (!recent.length) {
+    list.innerHTML = '<div class="operation-empty">还没有 Session。创建一个 Workspace 后，最近工作会显示在这里。</div>';
+    return;
+  }
+  list.innerHTML = recent.map(({workspace, session}) => `<button class="operation-row" data-recent-workspace="${escapeHTML(workspace.id)}" data-recent-session="${escapeHTML(session.id)}">
+    <span class="operation-agent ${escapeHTML(session.agent)}">${escapeHTML(agentGlyph(session.agent))}</span>
+    <span class="operation-copy"><b>${escapeHTML(session.name || agentLabel(session.agent))}</b><small>${escapeHTML(workspace.name)} · ${escapeHTML(agentLabel(session.agent))} · ${escapeHTML(statusLabel(session.status))}</small></span>
+    <time>${escapeHTML(formatDate(session.updated_at || session.created_at))}</time>
+  </button>`).join('');
 }
 
 function renderWorkspaceBatchToolbar(visible = visibleWorkspaces()) {
@@ -376,6 +438,7 @@ function renderDashboard() {
   const runningCount = state.workspaces.filter(ws => ws.status === 'running').length;
   const errorCount = state.workspaces.filter(ws => ws.status === 'error' || ws.status === 'missing').length;
   $('#workspaceListSummary').textContent = `${state.workspaces.length} 个环境 · ${runningCount} 个运行中${errorCount ? ` · ${errorCount} 个需要处理` : ''}`;
+  renderHomeOverview();
   state.selectedWorkspaceIDs = new Set([...state.selectedWorkspaceIDs].filter(id => state.workspaces.some(ws => ws.id === id)));
   const hasWorkspaces = state.workspaces.length > 0;
   $('#emptyState').classList.toggle('hidden', visible.length > 0);
@@ -919,8 +982,12 @@ async function refreshAll({quiet = false} = {}) {
   refreshPromise = (async () => {
   $('#refreshButton').disabled = true;
   try {
-    [state.templates, state.workspaces, state.accounts] = await Promise.all([api('/api/templates'), api('/api/workspaces'), api('/api/accounts')]);
+    [state.templates, state.environmentProfiles, state.workspaces, state.accounts] = await Promise.all([api('/api/templates'), api('/api/environment-profiles'), api('/api/workspaces'), api('/api/accounts')]);
     renderTemplates();
+    if (environmentProfilesDialog.open) {
+      const currentProfile = $('#environmentEditingID').value;
+      renderEnvironmentProfileList(currentProfile);
+    }
     if (accountsDialog.open) renderAccounts();
     if (state.currentWorkspace) {
       const updated = state.workspaces.find(ws => ws.id === state.currentWorkspace.id);
@@ -975,7 +1042,7 @@ function openCreate(files = null) {
   $('#createForm').reset();
   $('#createError').classList.add('hidden');
   $('#fileHint').textContent = '也可以点击选择；Git 与上传文件可同时使用。';
-  if (state.templates.length) setTemplate(state.templates[0].id);
+  if (state.templates.length) setTemplate(state.templates[0].id, '');
   renderAccountOptions($('#createAgentInput').value, $('#createAccountInput'));
   updateDirectFields('create', $('#createAgentInput').value);
   createDialog.showModal();
@@ -1320,6 +1387,125 @@ function parseEnvText(text) {
   }
   return result;
 }
+
+function packageTextToList(text) {
+  return text.split(/\r?\n/).map(item => item.trim()).filter(item => item && !item.startsWith('#'));
+}
+
+function environmentProfileFor(id) {
+  return state.environmentProfiles.find(profile => profile.id === id) || null;
+}
+
+function ensureSelectValue(select, value, label) {
+  const stringValue = String(value ?? '');
+  if (stringValue && ![...select.options].some(option => option.value === stringValue)) {
+    select.add(new Option(label || stringValue, stringValue));
+  }
+  select.value = stringValue;
+}
+
+function renderEnvironmentProfileList(selectedID = $('#environmentEditingID')?.value || '') {
+  const list = $('#environmentProfileList');
+  if (!state.environmentProfiles.length) {
+    list.innerHTML = '<div class="environment-list-empty">还没有定制环境。新建后，它会出现在 Workspace 的环境模板选择器中。</div>';
+    return;
+  }
+  list.innerHTML = state.environmentProfiles.map(profile => `<button type="button" class="environment-profile-item ${profile.id === selectedID ? 'selected' : ''}" data-environment-id="${escapeHTML(profile.id)}">
+    <span>${escapeHTML(profile.icon || '◇')}</span><div><b>${escapeHTML(profile.name)}</b><small>${escapeHTML(profile.description || '定制环境配置')}</small></div>
+  </button>`).join('');
+}
+
+function resetEnvironmentProfileEditor() {
+  $('#environmentProfileForm').reset();
+  $('#environmentEditingID').value = '';
+  $('#environmentEditorTitle').textContent = '新建定制环境';
+  $('#deleteEnvironmentProfile').classList.add('hidden');
+  $('#environmentProfileError').classList.add('hidden');
+  $('#environmentBaseTemplate').innerHTML = state.templates.map(template => `<option value="${escapeHTML(template.id)}">${escapeHTML(template.name)}</option>`).join('');
+  $('#environmentIcon').value = '◇';
+  $('#environmentCPUs').value = '2';
+  $('#environmentMemory').value = '4096';
+  renderEnvironmentProfileList('');
+}
+
+function editEnvironmentProfile(id) {
+  const profile = environmentProfileFor(id);
+  if (!profile) return resetEnvironmentProfileEditor();
+  $('#environmentEditingID').value = profile.id;
+  $('#environmentEditorTitle').textContent = profile.name;
+  $('#environmentName').value = profile.name;
+  $('#environmentDescription').value = profile.description || '';
+  ensureSelectValue($('#environmentIcon'), profile.icon || '◇', profile.icon || '◇');
+  ensureSelectValue($('#environmentBaseTemplate'), profile.base_template_id, profile.base_template_id);
+  ensureSelectValue($('#environmentCPUs'), profile.cpus, `${profile.cpus} vCPU`);
+  ensureSelectValue($('#environmentMemory'), profile.memory_mb, `${profile.memory_mb} MB`);
+  $('#environmentApt').value = (profile.apt_packages || []).join('\n');
+  $('#environmentNpm').value = (profile.npm_modules || []).join('\n');
+  $('#environmentPython').value = (profile.python_packages || []).join('\n');
+  $('#environmentVariables').value = envMapToText(profile.environment);
+  $('#environmentInitScript').value = profile.init_script || '';
+  $('#deleteEnvironmentProfile').classList.remove('hidden');
+  $('#environmentProfileError').classList.add('hidden');
+  renderEnvironmentProfileList(profile.id);
+}
+
+function openEnvironmentProfiles(selectedID = '') {
+  resetEnvironmentProfileEditor();
+  const selected = environmentProfileFor(selectedID) || state.environmentProfiles[0];
+  if (selected) editEnvironmentProfile(selected.id);
+  environmentProfilesDialog.showModal();
+}
+
+async function saveEnvironmentProfile(event) {
+  event.preventDefault();
+  const id = $('#environmentEditingID').value;
+  const button = $('#saveEnvironmentProfile');
+  const errorBox = $('#environmentProfileError');
+  button.disabled = true;
+  errorBox.classList.add('hidden');
+  try {
+    const payload = {
+      name:$('#environmentName').value.trim(), description:$('#environmentDescription').value.trim(), icon:$('#environmentIcon').value,
+      base_template_id:$('#environmentBaseTemplate').value, cpus:Number($('#environmentCPUs').value), memory_mb:Number($('#environmentMemory').value),
+      apt_packages:packageTextToList($('#environmentApt').value), npm_modules:packageTextToList($('#environmentNpm').value),
+      python_packages:packageTextToList($('#environmentPython').value), environment:parseEnvText($('#environmentVariables').value),
+      init_script:$('#environmentInitScript').value,
+    };
+    const saved = await api(id ? `/api/environment-profiles/${id}` : '/api/environment-profiles', {
+      method:id ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload),
+    });
+    state.environmentProfiles = await api('/api/environment-profiles');
+    state.selectedEnvironmentProfile = saved.id;
+    renderTemplates();
+    editEnvironmentProfile(saved.id);
+    showToast(id ? '定制环境已更新' : '定制环境已创建');
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.classList.remove('hidden');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteEnvironmentProfile() {
+  const id = $('#environmentEditingID').value;
+  const profile = environmentProfileFor(id);
+  if (!profile || !confirm(`删除定制环境“${profile.name}”？已有 Workspace 不会被删除。`)) return;
+  try {
+    await api(`/api/environment-profiles/${id}`, {method:'DELETE'});
+    state.environmentProfiles = await api('/api/environment-profiles');
+    if (state.selectedEnvironmentProfile === id) state.selectedEnvironmentProfile = null;
+    renderTemplates();
+    resetEnvironmentProfileEditor();
+    if (state.environmentProfiles[0]) editEnvironmentProfile(state.environmentProfiles[0].id);
+    showToast('定制环境已删除，已有 Workspace 保持不变');
+  } catch (error) {
+    const errorBox = $('#environmentProfileError');
+    errorBox.textContent = error.message;
+    errorBox.classList.remove('hidden');
+  }
+}
+
 function openAccountEditor(accountID = null, options = {}) {
   state.editingAccountID = accountID;
   if (!accountID && (options.returnTo || options.startLogin)) pendingAccountSelection = {returnTo:options.returnTo || 'accounts-login', agent:options.agent || 'codex', startLogin:Boolean(options.startLogin)};
@@ -1680,6 +1866,7 @@ $('#previewForm').addEventListener('submit', event => { event.preventDefault(); 
 $('#sessionDangerousSkip').onchange = () => { $('#sessionDangerousConfirmRow').classList.toggle('hidden', !$('#sessionDangerousSkip').checked); scheduleLaunchPreview(); };
 $('#sessionForm').addEventListener('submit', saveSession);
 $('#accountForm').addEventListener('submit', saveAccount);
+$('#environmentProfileForm').addEventListener('submit', saveEnvironmentProfile);
 $('#saveAccountConfig').onclick = () => void saveAccountConfig();
 $('#reloadAccountConfig').onclick = () => void loadAccountConfigFile();
 $('#resetAccountConfig').onclick = () => void resetAccountConfig();
@@ -1688,7 +1875,31 @@ $('#resetAccountConfig').onclick = () => void resetAccountConfig();
 const openCreateButton = $('#openCreate');
 if (openCreateButton) openCreateButton.onclick = () => openCreate();
 $('#quickImportButton').onclick = () => { openCreate(); $('#fileInput').click(); };
+$('#homeImportButton').onclick = () => { openCreate(); $('#fileInput').click(); };
 $('#openAccounts').onclick = openAccountManager;
+$('#openEnvironmentProfiles').onclick = () => openEnvironmentProfiles();
+$('#createManageEnvironments').onclick = () => openEnvironmentProfiles(state.selectedEnvironmentProfile || '');
+$('#newEnvironmentProfile').onclick = resetEnvironmentProfileEditor;
+$('#deleteEnvironmentProfile').onclick = deleteEnvironmentProfile;
+$('#environmentProfileList').addEventListener('click', event => {
+  const item = event.target.closest('[data-environment-id]');
+  if (item) editEnvironmentProfile(item.dataset.environmentId);
+});
+$$('[data-open-environments]').forEach(button => button.onclick = () => openEnvironmentProfiles());
+$$('[data-open-accounts]').forEach(button => button.onclick = openAccountManager);
+$$('[data-theme-toggle]').forEach(button => button.onclick = toggleTheme);
+$$('[data-home-filter]').forEach(button => button.onclick = () => {
+  state.filter = button.dataset.homeFilter;
+  $$('[data-filter]').forEach(item => item.classList.toggle('active', item.dataset.filter === state.filter));
+  renderDashboard();
+  $('.recent-heading')?.scrollIntoView({behavior:'smooth', block:'start'});
+});
+$('#recentSessionList').addEventListener('click', async event => {
+  const item = event.target.closest('[data-recent-workspace]');
+  if (!item) return;
+  await openWorkspace(item.dataset.recentWorkspace);
+  openTab('session', item.dataset.recentSession);
+});
 $('#refreshButton').onclick = () => refreshAll();
 $('#manageWorkspacesButton').onclick = () => setManagementMode(!state.managementMode);
 $('#exitManageButton').onclick = () => setManagementMode(false);
@@ -1930,6 +2141,7 @@ bindDropzone($('#dropzone'), $('#fileInput'), $('#fileHint'));
 bindDropzone($('#uploadDialog .dropzone'), $('#workspaceFileInput'), $('#workspaceFileHint'));
 
 async function boot() {
+  applyTheme(document.documentElement.dataset.theme, false);
   ensureCommandDialog();
   const healthBadge = $('#healthBadge');
   try {

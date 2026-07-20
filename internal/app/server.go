@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +98,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/templates", s.handleTemplates)
+	mux.HandleFunc("GET /api/environment-profiles", s.handleEnvironmentProfiles)
+	mux.HandleFunc("POST /api/environment-profiles", s.handleEnvironmentProfiles)
+	mux.HandleFunc("PATCH /api/environment-profiles/{profile}", s.handleEnvironmentProfile)
+	mux.HandleFunc("DELETE /api/environment-profiles/{profile}", s.handleEnvironmentProfile)
 	mux.HandleFunc("POST /api/launch-preview", s.handleLaunchPreview)
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
@@ -262,7 +267,20 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "名称不能为空且不能超过 80 个字符", nil)
 		return
 	}
+	environmentProfileID := strings.TrimSpace(r.FormValue("environment_profile_id"))
+	var environmentProfile model.EnvironmentProfile
+	if environmentProfileID != "" {
+		var found bool
+		environmentProfile, found = s.store.GetEnvironmentProfile(environmentProfileID)
+		if !found {
+			writeError(w, http.StatusBadRequest, "定制环境不存在", nil)
+			return
+		}
+	}
 	templateID := strings.TrimSpace(r.FormValue("template_id"))
+	if environmentProfile.ID != "" {
+		templateID = environmentProfile.BaseTemplateID
+	}
 	template, ok := s.templates[templateID]
 	if !ok {
 		writeError(w, http.StatusBadRequest, "未知环境模板", nil)
@@ -285,11 +303,36 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Agent 参数无效", err)
 		return
 	}
-	cpus := clampFloat(parseFloat(r.FormValue("cpus"), 2), 0.25, 32)
-	memoryMB := clampInt(parseInt(r.FormValue("memory_mb"), 4096), 512, 131072)
-	environment, envKeys, err := parseEnvironment(r.FormValue("environment"))
+	defaultCPUs, defaultMemoryMB := 2.0, 4096
+	if environmentProfile.ID != "" {
+		defaultCPUs, defaultMemoryMB = environmentProfile.CPUs, environmentProfile.MemoryMB
+	}
+	cpus := clampFloat(parseFloat(r.FormValue("cpus"), defaultCPUs), 0.25, 32)
+	memoryMB := clampInt(parseInt(r.FormValue("memory_mb"), defaultMemoryMB), 512, 131072)
+	requestEnvironment, _, err := parseEnvironment(r.FormValue("environment"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "环境变量格式错误", err)
+		return
+	}
+	environment := make(map[string]string, len(environmentProfile.Environment)+len(requestEnvironment))
+	for key, value := range environmentProfile.Environment {
+		environment[key] = value
+	}
+	for key, value := range requestEnvironment {
+		environment[key] = value
+	}
+	envKeys := make([]string, 0, len(environment))
+	for key := range environment {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	setup := model.EnvironmentSetup{
+		AptPackages: environmentProfile.AptPackages, NPMModules: environmentProfile.NPMModules,
+		PythonPackages: environmentProfile.PythonPackages, InitScript: environmentProfile.InitScript,
+	}
+	initializer, canInitialize := s.runtime.(model.EnvironmentRuntime)
+	if environmentSetupRequired(setup) && !canInitialize {
+		writeError(w, http.StatusInternalServerError, "当前运行时不支持定制环境初始化", nil)
 		return
 	}
 
@@ -315,7 +358,8 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		ContainerName: containerName, Status: "creating", Source: detectSource(r),
 		CreatedAt: now, UpdatedAt: now, Password: password,
 		PasswordCiphertext: passwordCiphertext, PasswordHint: secretHint(password), CPUs: cpus,
-		MemoryMB: memoryMB, EnvKeys: envKeys,
+		MemoryMB: memoryMB, EnvKeys: envKeys, EnvironmentProfileID: environmentProfile.ID,
+		EnvironmentProfileName: environmentProfile.Name,
 	}
 	if err := s.store.Put(ws); err != nil {
 		writeError(w, http.StatusInternalServerError, "无法保存 Workspace", err)
@@ -350,6 +394,14 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.importUploads(r.Context(), r.MultipartForm, containerName); err != nil {
 		ws.Error = joinErrors(ws.Error, "文件导入失败："+err.Error())
+	}
+	if environmentSetupRequired(setup) {
+		if err := initializer.InitializeEnvironment(r.Context(), containerName, setup); err != nil {
+			_ = s.runtime.Delete(r.Context(), containerName, true)
+			_ = s.store.Delete(id)
+			writeError(w, http.StatusInternalServerError, "定制环境初始化失败", err)
+			return
+		}
 	}
 
 	session, sessionErr := s.newSession(&ws, defaultSessionName(agent, 1), agent, accountID, directConfig)
@@ -1315,6 +1367,10 @@ func parseEnvironment(raw string) (map[string]string, []string, error) {
 		values[key] = value
 	}
 	return values, keys, nil
+}
+
+func environmentSetupRequired(setup model.EnvironmentSetup) bool {
+	return len(setup.AptPackages) > 0 || len(setup.NPMModules) > 0 || len(setup.PythonPackages) > 0 || strings.TrimSpace(setup.InitScript) != ""
 }
 
 func validateGitURL(raw string) error {

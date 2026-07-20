@@ -50,6 +50,21 @@ VS Code + Shell
 
 Preview 仍要求容器内服务监听 `0.0.0.0`。部分依赖根路径绝对资源或强绑定独立域名的应用，仍可能需要应用自身配置 base path。
 
+## 定制环境与首页
+
+首页是运行概览而不是营销页：它显示 Workspace 数量、运行中环境、活跃 Session、需要处理的状态，并提供最近 Session 恢复、项目导入、账号管理和定制环境入口。首页和 Workspace 工作台都支持亮色/暗色模式，选择会保存在当前浏览器。
+
+定制环境是基于内置模板的可复用配置档，不允许提交任意 Dockerfile 或替换 VibeDock 基础镜像。配置档可以保存：
+
+- APT 包；
+- npm 全局模块；
+- Python 包（安装到独立的 `/home/coder/.venvs/vibedock`）；
+- 非敏感环境变量；
+- 以 `coder` 身份从 `/workspace` 执行的初始化脚本；
+- 创建 Workspace 时使用的 CPU、内存默认值。
+
+创建 Workspace 时可以选择固定模板或定制环境；创建请求仍可以覆盖资源和普通环境变量。安装与初始化发生在项目 Git/文件导入后，已有 Workspace 不会因为定制环境被编辑或删除而改变。配置档不会保存明显的 API Key、Token、Secret 或 Password 变量。
+
 ## 0.4 新功能：Pi Agent 与 OpenCode
 
 - 新增 Pi Agent Session；
@@ -465,6 +480,10 @@ VIBEDOCK_MAX_LOGIN_HELPERS=3
 ```text
 GET    /api/health
 GET    /api/templates
+GET    /api/environment-profiles
+POST   /api/environment-profiles
+PATCH  /api/environment-profiles/{profile}
+DELETE /api/environment-profiles/{profile}
 
 GET    /api/accounts
 POST   /api/accounts
