@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -21,6 +19,8 @@ const (
 	defaultAuthTTL       = 15 * time.Minute
 	completedAuthKeepTTL = 10 * time.Minute
 	defaultAuthCapacity  = 3
+	authResponseLimit    = 8 << 10
+	authCompletionTTL    = 80 * time.Second
 )
 
 type AccountAuthOptions struct {
@@ -55,8 +55,6 @@ type loginAttemptView struct {
 	ExpiresAt       time.Time              `json:"expires_at"`
 	PollAfterMS     int64                  `json:"poll_after_ms"`
 	VerificationURL string                 `json:"verification_url,omitempty"`
-	UserCode        string                 `json:"user_code,omitempty"`
-	TerminalURL     string                 `json:"terminal_url,omitempty"`
 	Message         string                 `json:"message,omitempty"`
 	ErrorCode       string                 `json:"error_code,omitempty"`
 }
@@ -99,7 +97,7 @@ func newAccountAuthManager(runtime model.AuthRuntime, options AccountAuthOptions
 
 func providerForAccount(account model.AccountProfile) (model.AuthProvider, error) {
 	if account.AuthType != "login" {
-		return "", errors.New("只有网页登录 / 官方 CLI 账号支持此操作")
+		return "", errors.New("只有网页登录账号支持此操作")
 	}
 	switch account.Agent {
 	case "codex":
@@ -159,14 +157,19 @@ func (s *Server) handleAccountAuthStatus(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: model.AuthStatusUnavailable, CheckedAt: time.Now().UTC(), Message: "登录助手尚未启用"})
 		return
 	}
-	if attempt := s.auth.current(account.ID); attempt != nil && !attempt.State.Terminal() {
-		view := s.auth.publicAttempt(*attempt)
-		writeJSON(w, http.StatusOK, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: model.AuthStatusLoginInProgress, CheckedAt: time.Now().UTC(), Message: attempt.Message, Attempt: &view})
-		return
+	if attempt := s.auth.current(account.ID); attempt != nil {
+		if fresh, inspectErr := s.auth.inspect(r.Context(), account.ID, attempt.AttemptID, provider); inspectErr == nil {
+			attempt = &fresh
+		}
+		if !attempt.State.Terminal() {
+			view := s.auth.publicAttempt(*attempt)
+			writeJSON(w, http.StatusOK, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: model.AuthStatusLoginInProgress, CheckedAt: time.Now().UTC(), Message: attempt.Message, Attempt: &view})
+			return
+		}
 	}
 	result, err := s.auth.runtime.AuthStatus(r.Context(), model.AuthStatusRequest{AccountID: account.ID, Provider: provider})
 	if err != nil {
-		writeJSON(w, http.StatusOK, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: model.AuthStatusUnavailable, CheckedAt: time.Now().UTC(), Message: "暂时无法检查官方 CLI 登录状态"})
+		writeJSON(w, http.StatusOK, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: model.AuthStatusUnavailable, CheckedAt: time.Now().UTC(), Message: "暂时无法检查本地登录凭据"})
 		return
 	}
 	writeJSON(w, http.StatusOK, accountAuthStatusView{AccountID: account.ID, Provider: provider, State: result.Status, CheckedAt: result.CheckedAt, Message: result.Message})
@@ -228,9 +231,65 @@ func (s *Server) handleAccountLoginAttempt(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "登录助手尚未启用", nil)
 		return
 	}
-	attempt, err := s.auth.inspect(r.Context(), account.ID, attemptID)
+	provider, err := providerForAccount(account)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "登录尝试不存在或已过期", nil)
+		writeError(w, http.StatusBadRequest, "账号不支持网页登录", err)
+		return
+	}
+	attempt, err := s.auth.inspect(r.Context(), account.ID, attemptID, provider)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errAuthNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, "无法读取登录尝试", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.auth.publicAttempt(attempt))
+}
+
+func (s *Server) handleCompleteAccountLogin(w http.ResponseWriter, r *http.Request) {
+	setAuthResponseHeaders(w)
+	s.accountOperationMu.Lock()
+	defer s.accountOperationMu.Unlock()
+	if err := validateAuthMutation(r); err != nil {
+		writeError(w, http.StatusForbidden, "完成登录请求被拒绝", err)
+		return
+	}
+	account, ok := s.accountFromRequest(w, r)
+	if !ok {
+		return
+	}
+	provider, err := providerForAccount(account)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "账号不支持网页登录", err)
+		return
+	}
+	attemptID := strings.TrimSpace(r.PathValue("attempt"))
+	if s.auth == nil || !validAuthAttemptID(attemptID) {
+		writeError(w, http.StatusNotFound, "登录尝试不存在", nil)
+		return
+	}
+	var input struct {
+		AuthorizationResponse string `json:"authorization_response"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "授权结果格式错误", nil)
+		return
+	}
+	if strings.TrimSpace(input.AuthorizationResponse) == "" || len(input.AuthorizationResponse) > authResponseLimit || strings.IndexByte(input.AuthorizationResponse, 0) >= 0 {
+		writeError(w, http.StatusBadRequest, "授权结果为空或过长", nil)
+		return
+	}
+	attempt, err := s.auth.complete(r.Context(), account.ID, attemptID, provider, input.AuthorizationResponse)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errAuthNotFound) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, errAuthEnded) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, "无法完成网页登录", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.auth.publicAttempt(attempt))
@@ -238,6 +297,8 @@ func (s *Server) handleAccountLoginAttempt(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleCancelAccountLogin(w http.ResponseWriter, r *http.Request) {
 	setAuthResponseHeaders(w)
+	s.accountOperationMu.Lock()
+	defer s.accountOperationMu.Unlock()
 	if err := validateAuthMutation(r); err != nil {
 		writeError(w, http.StatusForbidden, "取消登录请求被拒绝", err)
 		return
@@ -251,12 +312,21 @@ func (s *Server) handleCancelAccountLogin(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, "登录尝试不存在", nil)
 		return
 	}
-	if err := s.auth.cancel(r.Context(), account.ID, attemptID); err != nil {
+	provider, err := providerForAccount(account)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "账号不支持网页登录", err)
+		return
+	}
+	if err := s.auth.cancel(r.Context(), account.ID, attemptID, provider); err != nil {
 		if errors.Is(err, errAuthCompleted) {
 			writeError(w, http.StatusConflict, "登录已经完成", nil)
 			return
 		}
-		writeError(w, http.StatusNotFound, "登录尝试不存在", nil)
+		if errors.Is(err, errAuthNotFound) {
+			writeError(w, http.StatusNotFound, "登录尝试不存在", nil)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "无法取消登录", nil)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -304,94 +374,11 @@ func (s *Server) handleAccountLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"state": model.AuthStatusUnauthenticated, "local_credentials_removed": result.LocalCredentialsRemoved, "provider_logout": providerStatus, "message": result.Message})
 }
 
-func (s *Server) handleAccountAuthTerminal(w http.ResponseWriter, r *http.Request) {
-	setAuthResponseHeaders(w)
-	account, ok := s.accountFromRequest(w, r)
-	if !ok {
-		return
-	}
-	attemptID := strings.TrimSpace(r.PathValue("attempt"))
-	if s.auth == nil || !validAuthAttemptID(attemptID) {
-		http.NotFound(w, r)
-		return
-	}
-	attempt, err := s.auth.inspect(r.Context(), account.ID, attemptID)
-	if err != nil || attempt.Provider != model.AuthProviderClaude {
-		http.NotFound(w, r)
-		return
-	}
-	if attempt.State.Terminal() {
-		writeError(w, http.StatusGone, "登录终端已关闭", nil)
-		return
-	}
-	if !sameOriginWebSocket(r) {
-		writeError(w, http.StatusForbidden, "登录终端 Origin 不匹配", nil)
-		return
-	}
-	targetInfo, err := s.auth.runtime.AuthTerminal(r.Context(), attempt.AuthAttemptRef)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "登录终端不可达", nil)
-		return
-	}
-	target, err := url.Parse(targetInfo.URL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "登录终端目标无效", nil)
-		return
-	}
-	prefix := fmt.Sprintf("/auth/accounts/%s/login-attempts/%s/terminal", account.ID, attemptID)
-	if r.URL.Path == prefix {
-		http.Redirect(w, r, prefix+"/", http.StatusTemporaryRedirect)
-		return
-	}
-	if !strings.HasPrefix(r.URL.Path, prefix+"/") {
-		http.NotFound(w, r)
-		return
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.FlushInterval = -1
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalHost := req.Host
-		originalDirector(req)
-		req.Host = originalHost
-		req.Header.Set("X-Forwarded-Host", originalHost)
-		req.Header.Set("X-Forwarded-Prefix", prefix)
-		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(targetInfo.Username+":"+targetInfo.Password)))
-		path := strings.TrimPrefix(req.URL.Path, prefix)
-		if path == "" {
-			path = "/"
-		}
-		req.URL.Path = path
-		req.URL.RawPath = ""
-	}
-	proxy.ModifyResponse = func(response *http.Response) error {
-		response.Header.Set("Cache-Control", "no-store, private")
-		response.Header.Set("Referrer-Policy", "no-referrer")
-		response.Header.Set("X-Frame-Options", "SAMEORIGIN")
-		response.Header.Set("Content-Security-Policy", "frame-ancestors 'self'")
-		return nil
-	}
-	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, _ error) {
-		writeError(rw, http.StatusBadGateway, "登录终端连接失败", nil)
-	}
-	proxy.ServeHTTP(w, r)
-}
-
-func sameOriginWebSocket(r *http.Request) bool {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return true
-	}
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return false
-	}
-	parsed, err := url.Parse(origin)
-	return err == nil && parsed.Host == r.Host && (parsed.Scheme == "http" || parsed.Scheme == "https")
-}
-
 var (
 	errAuthCapacity  = errors.New("同时最多运行 3 个登录助手，请稍后重试")
 	errAuthCompleted = errors.New("登录已经完成")
+	errAuthNotFound  = errors.New("登录尝试不存在")
+	errAuthEnded     = errors.New("登录尝试已经结束")
 )
 
 func validAuthAttemptID(value string) bool {
@@ -415,6 +402,23 @@ func randomAuthAttemptID() (string, error) {
 }
 
 func (m *accountAuthManager) start(ctx context.Context, accountID string, provider model.AuthProvider) (model.AuthRuntimeAttempt, bool, error) {
+	m.mu.Lock()
+	existingID := m.attemptByAccount[accountID]
+	existingState := model.AuthAttemptState("")
+	if existing := m.attempts[existingID]; existing != nil {
+		existingState = existing.view.State
+	}
+	m.mu.Unlock()
+	if existingID != "" && (!existingState.Terminal() || existingState == model.AuthAttemptExpired) {
+		existing, err := m.inspect(ctx, accountID, existingID, provider)
+		if err != nil {
+			return model.AuthRuntimeAttempt{}, false, err
+		}
+		if !existing.State.Terminal() {
+			return existing, true, nil
+		}
+	}
+
 	m.mu.Lock()
 	expired := m.pruneLocked(time.Now().UTC())
 	if attemptID := m.attemptByAccount[accountID]; attemptID != "" {
@@ -443,7 +447,7 @@ func (m *accountAuthManager) start(ctx context.Context, accountID string, provid
 		return model.AuthRuntimeAttempt{}, false, err
 	}
 	now := time.Now().UTC()
-	seed := model.AuthRuntimeAttempt{AuthAttemptRef: model.AuthAttemptRef{AccountID: accountID, AttemptID: attemptID, Provider: provider}, State: model.AuthAttemptStarting, ExpiresAt: now.Add(m.ttl), PollAfter: 2 * time.Second, Message: "正在启动官方登录助手"}
+	seed := model.AuthRuntimeAttempt{AuthAttemptRef: model.AuthAttemptRef{AccountID: accountID, AttemptID: attemptID, Provider: provider}, State: model.AuthAttemptStarting, ExpiresAt: now.Add(m.ttl), PollAfter: 2 * time.Second, Message: "正在准备官方授权"}
 	entry := &accountAuthAttempt{view: seed, updatedAt: now}
 	m.attempts[attemptID] = entry
 	m.attemptByAccount[accountID] = attemptID
@@ -472,15 +476,15 @@ func (m *accountAuthManager) start(ctx context.Context, accountID string, provid
 	}
 	if startErr != nil {
 		entry.view.State = model.AuthAttemptFailed
-		entry.view.ErrorCode = "auth_helper_start_failed"
-		entry.view.Message = "官方登录助手启动失败"
+		entry.view.ErrorCode = "authorization_start_failed"
+		entry.view.Message = "无法准备官方授权"
 		entry.view.VerificationURL = ""
 		entry.view.UserCode = ""
 		entry.view.TerminalAvailable = false
 		entry.updatedAt = time.Now().UTC()
 		view := entry.view
 		m.mu.Unlock()
-		return view, false, errors.New("官方登录助手启动失败")
+		return view, false, errors.New("无法准备官方授权")
 	}
 	entry.view = started
 	entry.updatedAt = time.Now().UTC()
@@ -491,94 +495,198 @@ func (m *accountAuthManager) start(ctx context.Context, accountID string, provid
 
 func (m *accountAuthManager) current(accountID string) *model.AuthRuntimeAttempt {
 	m.mu.Lock()
-	expired := m.pruneLocked(time.Now().UTC())
 	attempt := m.attempts[m.attemptByAccount[accountID]]
 	if attempt == nil {
 		m.mu.Unlock()
-		m.cancelExpired(expired)
 		return nil
 	}
 	view := attempt.view
 	m.mu.Unlock()
-	m.cancelExpired(expired)
+	if !view.State.Terminal() && !time.Now().UTC().Before(view.ExpiresAt) {
+		view.State = model.AuthAttemptExpired
+		view.Message = "登录已过期，请重新开始"
+		view.VerificationURL = ""
+		view.UserCode = ""
+		view.TerminalAvailable = false
+	}
 	return &view
 }
 
-func (m *accountAuthManager) inspect(ctx context.Context, accountID, attemptID string) (model.AuthRuntimeAttempt, error) {
+func (m *accountAuthManager) attemptEntry(ctx context.Context, accountID, attemptID string, provider model.AuthProvider) (*accountAuthAttempt, bool, error) {
 	m.mu.Lock()
-	expired := m.pruneLocked(time.Now().UTC())
 	entry := m.attempts[attemptID]
-	if entry == nil || entry.view.AccountID != accountID {
+	if entry != nil {
+		if entry.view.AccountID != accountID || entry.view.Provider != provider {
+			m.mu.Unlock()
+			return nil, false, errAuthNotFound
+		}
 		m.mu.Unlock()
-		m.cancelExpired(expired)
-		return model.AuthRuntimeAttempt{}, errors.New("not found")
+		return entry, false, nil
 	}
-	cached := entry.view
 	m.mu.Unlock()
-	m.cancelExpired(expired)
-	if cached.State.Terminal() {
-		return cached, nil
+
+	ref := model.AuthAttemptRef{AccountID: accountID, AttemptID: attemptID, Provider: provider}
+	fresh, err := m.runtime.InspectAuth(ctx, ref)
+	if err != nil {
+		return nil, false, errAuthNotFound
+	}
+	recovered := &accountAuthAttempt{view: fresh, updatedAt: time.Now().UTC()}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry = m.attempts[attemptID]; entry != nil {
+		if entry.view.AccountID != accountID || entry.view.Provider != provider {
+			return nil, false, errAuthNotFound
+		}
+		return entry, false, nil
+	}
+	m.attempts[attemptID] = recovered
+	currentID := m.attemptByAccount[accountID]
+	if currentID == "" || m.attempts[currentID] == nil || m.attempts[currentID].view.State.Terminal() {
+		m.attemptByAccount[accountID] = attemptID
+	}
+	return recovered, true, nil
+}
+
+func (m *accountAuthManager) inspect(ctx context.Context, accountID, attemptID string, provider model.AuthProvider) (model.AuthRuntimeAttempt, error) {
+	entry, recovered, err := m.attemptEntry(ctx, accountID, attemptID, provider)
+	if err != nil {
+		return model.AuthRuntimeAttempt{}, err
+	}
+	if recovered {
+		return entry.view, nil
 	}
 	entry.runtimeMu.Lock()
 	defer entry.runtimeMu.Unlock()
 	m.mu.Lock()
 	entry = m.attempts[attemptID]
-	if entry == nil || entry.view.AccountID != accountID {
+	if entry == nil || entry.view.AccountID != accountID || entry.view.Provider != provider {
 		m.mu.Unlock()
-		return model.AuthRuntimeAttempt{}, errors.New("not found")
+		return model.AuthRuntimeAttempt{}, errAuthNotFound
 	}
-	cached = entry.view
+	cached := entry.view
 	m.mu.Unlock()
-	if cached.State.Terminal() {
+	if cached.State == model.AuthAttemptCompleted || cached.State == model.AuthAttemptCancelled {
 		return cached, nil
 	}
 	fresh, err := m.runtime.InspectAuth(ctx, cached.AuthAttemptRef)
+	if err != nil {
+		return model.AuthRuntimeAttempt{}, fmt.Errorf("inspect authorization state: %w", err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry = m.attempts[attemptID]
 	if entry == nil {
-		return model.AuthRuntimeAttempt{}, errors.New("not found")
+		return model.AuthRuntimeAttempt{}, errAuthNotFound
 	}
-	if err != nil {
-		entry.view.State = model.AuthAttemptFailed
-		entry.view.ErrorCode = "auth_helper_failed"
-		entry.view.Message = "官方登录助手异常退出"
-		entry.view.VerificationURL = ""
-		entry.view.UserCode = ""
-		entry.view.TerminalAvailable = false
-	} else {
-		entry.view = fresh
-		if fresh.State.Terminal() {
-			entry.view.VerificationURL = ""
-			entry.view.UserCode = ""
-			entry.view.TerminalAvailable = false
-		}
-	}
+	entry.view = fresh
 	entry.updatedAt = time.Now().UTC()
 	return entry.view, nil
 }
 
-func (m *accountAuthManager) cancel(ctx context.Context, accountID, attemptID string) error {
-	m.mu.Lock()
-	entry := m.attempts[attemptID]
-	if entry == nil || entry.view.AccountID != accountID {
-		m.mu.Unlock()
-		return errors.New("not found")
+func (m *accountAuthManager) complete(ctx context.Context, accountID, attemptID string, provider model.AuthProvider, response string) (model.AuthRuntimeAttempt, error) {
+	operationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authCompletionTTL)
+	defer cancel()
+	ctx = operationCtx
+	entry, _, err := m.attemptEntry(ctx, accountID, attemptID, provider)
+	if err != nil {
+		return model.AuthRuntimeAttempt{}, err
 	}
-	if entry.view.State == model.AuthAttemptCompleted {
+	entry.runtimeMu.Lock()
+	defer entry.runtimeMu.Unlock()
+	m.mu.Lock()
+	entry = m.attempts[attemptID]
+	if entry == nil {
 		m.mu.Unlock()
+		return model.AuthRuntimeAttempt{}, errAuthNotFound
+	}
+	cached := entry.view
+	m.mu.Unlock()
+	if cached.State == model.AuthAttemptCompleted {
+		return cached, nil
+	}
+	if cached.State.Terminal() {
+		return model.AuthRuntimeAttempt{}, errAuthEnded
+	}
+	fresh, completeErr := m.runtime.CompleteAuth(ctx, model.AuthCompleteRequest{AuthAttemptRef: cached.AuthAttemptRef, AuthorizationResponse: response})
+	if completeErr != nil {
+		if inspected, inspectErr := m.runtime.InspectAuth(ctx, cached.AuthAttemptRef); inspectErr == nil {
+			m.mu.Lock()
+			if current := m.attempts[attemptID]; current != nil {
+				current.view = inspected
+				current.updatedAt = time.Now().UTC()
+			}
+			m.mu.Unlock()
+			if inspected.State.Terminal() {
+				return inspected, nil
+			}
+		}
+		return model.AuthRuntimeAttempt{}, completeErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry = m.attempts[attemptID]
+	if entry == nil {
+		return model.AuthRuntimeAttempt{}, errAuthNotFound
+	}
+	entry.view = fresh
+	entry.updatedAt = time.Now().UTC()
+	return entry.view, nil
+}
+
+func (m *accountAuthManager) cancel(ctx context.Context, accountID, attemptID string, provider model.AuthProvider) error {
+	entry, _, err := m.attemptEntry(ctx, accountID, attemptID, provider)
+	if err != nil {
+		return err
+	}
+	entry.runtimeMu.Lock()
+	defer entry.runtimeMu.Unlock()
+	m.mu.Lock()
+	entry = m.attempts[attemptID]
+	if entry == nil {
+		m.mu.Unlock()
+		return errAuthNotFound
+	}
+	cached := entry.view
+	m.mu.Unlock()
+	if cached.State != model.AuthAttemptCompleted && !cached.State.Terminal() {
+		if fresh, inspectErr := m.runtime.InspectAuth(ctx, cached.AuthAttemptRef); inspectErr == nil {
+			cached = fresh
+			m.mu.Lock()
+			if current := m.attempts[attemptID]; current != nil {
+				current.view = fresh
+				current.updatedAt = time.Now().UTC()
+			}
+			m.mu.Unlock()
+		}
+	}
+	if cached.State == model.AuthAttemptCompleted {
 		return errAuthCompleted
 	}
-	if entry.view.State.Terminal() {
-		m.mu.Unlock()
+	if cached.State.Terminal() {
 		return nil
 	}
+	m.mu.Lock()
 	entry.view.State = model.AuthAttemptCancelling
 	ref := entry.view.AuthAttemptRef
 	m.mu.Unlock()
-	entry.runtimeMu.Lock()
-	err := m.runtime.CancelAuth(ctx, ref)
-	entry.runtimeMu.Unlock()
+	err = m.runtime.CancelAuth(ctx, ref)
+	if fresh, inspectErr := m.runtime.InspectAuth(ctx, ref); inspectErr == nil {
+		m.mu.Lock()
+		if current := m.attempts[attemptID]; current != nil {
+			current.view = fresh
+			current.updatedAt = time.Now().UTC()
+		}
+		m.mu.Unlock()
+		if fresh.State == model.AuthAttemptCompleted {
+			return errAuthCompleted
+		}
+		if err == nil {
+			return nil
+		}
+	}
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry = m.attempts[attemptID]; entry != nil {
@@ -589,32 +697,24 @@ func (m *accountAuthManager) cancel(ctx context.Context, accountID, attemptID st
 		entry.view.TerminalAvailable = false
 		entry.updatedAt = time.Now().UTC()
 	}
-	return err
+	return nil
 }
 
 func (m *accountAuthManager) cancelCurrent(ctx context.Context, accountID string) error {
 	attempt := m.current(accountID)
-	if attempt == nil || attempt.State.Terminal() {
+	if attempt == nil || attempt.State == model.AuthAttemptCompleted || attempt.State == model.AuthAttemptCancelled || attempt.State == model.AuthAttemptFailed {
 		return nil
 	}
-	return m.cancel(ctx, accountID, attempt.AttemptID)
+	return m.cancel(ctx, accountID, attempt.AttemptID, attempt.Provider)
 }
 
 func (m *accountAuthManager) publicAttempt(attempt model.AuthRuntimeAttempt) loginAttemptView {
-	flow := "device_code"
-	terminalURL := ""
-	if attempt.Provider == model.AuthProviderClaude {
-		flow = "terminal"
-		if attempt.TerminalAvailable && !attempt.State.Terminal() {
-			terminalURL = fmt.Sprintf("/auth/accounts/%s/login-attempts/%s/terminal/", attempt.AccountID, attempt.AttemptID)
-		}
-	}
 	pollAfter := attempt.PollAfter
 	if pollAfter < time.Second {
 		pollAfter = 2 * time.Second
 	}
 	createdAt := attempt.ExpiresAt.Add(-m.ttl)
-	return loginAttemptView{ID: attempt.AttemptID, AccountID: attempt.AccountID, Provider: attempt.Provider, Flow: flow, State: attempt.State, CreatedAt: createdAt, ExpiresAt: attempt.ExpiresAt, PollAfterMS: pollAfter.Milliseconds(), VerificationURL: attempt.VerificationURL, UserCode: attempt.UserCode, TerminalURL: terminalURL, Message: attempt.Message, ErrorCode: attempt.ErrorCode}
+	return loginAttemptView{ID: attempt.AttemptID, AccountID: attempt.AccountID, Provider: attempt.Provider, Flow: "authorization_code", State: attempt.State, CreatedAt: createdAt, ExpiresAt: attempt.ExpiresAt, PollAfterMS: pollAfter.Milliseconds(), VerificationURL: attempt.VerificationURL, Message: attempt.Message, ErrorCode: attempt.ErrorCode}
 }
 
 func (m *accountAuthManager) pruneLocked(now time.Time) []model.AuthAttemptRef {
@@ -656,16 +756,8 @@ func (m *accountAuthManager) cancelExpired(refs []model.AuthAttemptRef) {
 	}
 }
 
-func (m *accountAuthManager) Close(ctx context.Context) {
-	m.mu.Lock()
-	refs := make([]model.AuthAttemptRef, 0)
-	for _, attempt := range m.attempts {
-		if !attempt.view.State.Terminal() {
-			refs = append(refs, attempt.view.AuthAttemptRef)
-		}
-	}
-	m.mu.Unlock()
-	for _, ref := range refs {
-		_ = m.runtime.CancelAuth(ctx, ref)
-	}
+func (m *accountAuthManager) Close(_ context.Context) {
+	// Attempts and PKCE state are persisted in the credential volume. One-shot
+	// helpers are bounded, so shutdown must not race a credential commit with a
+	// second cancellation helper; the next process reconciles the saved state.
 }

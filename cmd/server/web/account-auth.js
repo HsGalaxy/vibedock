@@ -27,6 +27,24 @@
     pending: 'login_in_progress',
     error: 'unknown',
   };
+  const OFFICIAL_AUTHORIZATION_ENDPOINTS = Object.freeze({
+    codex: {
+      hostname: 'auth.openai.com',
+      pathname: '/oauth/authorize',
+      clientID: 'app_EMoamEEZ73f0CkXaXp7hrann',
+      redirectURI: 'http://localhost:1455/auth/callback',
+      scope: 'openid profile email offline_access api.connectors.read api.connectors.invoke',
+      extra: {id_token_add_organizations:'true', codex_cli_simplified_flow:'true', originator:'codex_cli_rs'},
+    },
+    claude: {
+      hostname: 'claude.com',
+      pathname: '/cai/oauth/authorize',
+      clientID: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+      redirectURI: 'https://platform.claude.com/oauth/code/callback',
+      scope: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+      extra: {code:'true'},
+    },
+  });
 
   function cleanString(value) {
     return typeof value === 'string' ? value.trim() : '';
@@ -84,12 +102,10 @@
       message: cleanString(source.message || source.status_message),
       errorCode: cleanString(source.error_code || error.code),
       errorMessage: cleanString(source.error_message || error.message || (typeof source.error === 'string' ? source.error : '')),
-      verificationURL: cleanString(source.verification_url || source.verification_uri || source.verification_uri_complete),
-      userCode: cleanString(source.user_code || source.device_code),
+      verificationURL: cleanString(source.authorization_url || source.verification_url || source.verification_uri || source.verification_uri_complete),
     };
     if (terminal) {
       normalized.verificationURL = '';
-      normalized.userCode = '';
     }
     return normalized;
   }
@@ -122,11 +138,11 @@
 
   function attemptStatePresentation(state) {
     return ({
-      starting: '正在启动官方登录…',
-      awaiting_user: '等待你在官方页面完成登录',
-      verifying: '正在通过官方 CLI 验证登录状态…',
+      starting: '正在生成官方授权请求…',
+      awaiting_user: '等待你在官方页面授权并提交返回结果',
+      verifying: '正在校验授权响应并保存凭据…',
       cancelling: '正在取消登录…',
-      completed: '登录完成，官方 CLI 已确认账号状态',
+      completed: '登录完成，凭据已保存',
       cancelled: '登录已取消',
       expired: '登录请求已过期',
       failed: '登录未完成',
@@ -141,17 +157,73 @@
     return TERMINAL_ATTEMPT_STATES.has(normalizeAttemptState(state));
   }
 
-  function safeOfficialURL(value) {
+  function safeOfficialURL(value, provider = '') {
     const raw = cleanString(value);
     if (!raw || raw.length > 2048) return '';
     try {
       const parsed = new URL(raw);
       if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return '';
       if (parsed.port && parsed.port !== '443') return '';
+      if (parsed.hash) return '';
+      const normalizedProvider = normalizeProvider(provider);
+      const allowed = normalizedProvider
+        ? [OFFICIAL_AUTHORIZATION_ENDPOINTS[normalizedProvider]]
+        : Object.values(OFFICIAL_AUTHORIZATION_ENDPOINTS);
+      const endpoint = allowed.find(candidate => candidate.hostname === parsed.hostname && candidate.pathname === parsed.pathname);
+      if (!endpoint) return '';
+      const required = {
+        client_id:endpoint.clientID,
+        redirect_uri:endpoint.redirectURI,
+        response_type:'code',
+        code_challenge_method:'S256',
+        scope:endpoint.scope,
+        ...endpoint.extra,
+      };
+      if (Object.entries(required).some(([key, expected]) => parsed.searchParams.getAll(key).length !== 1 || parsed.searchParams.get(key) !== expected)) return '';
+      const state = parsed.searchParams.getAll('state');
+      const challenge = parsed.searchParams.getAll('code_challenge');
+      if (state.length !== 1 || !/^[A-Za-z0-9._~-]{20,256}$/.test(state[0])) return '';
+      if (challenge.length !== 1 || !/^[A-Za-z0-9._~-]{43}$/.test(challenge[0])) return '';
       return parsed.href;
     } catch (_) {
       return '';
     }
+  }
+
+  function hasSingleQueryValue(parsed, key) {
+    return parsed.searchParams.getAll(key).length === 1 && Boolean(parsed.searchParams.get(key));
+  }
+
+  function normalizeAuthorizationResponse(provider, value) {
+    const normalizedProvider = normalizeProvider(provider);
+    const raw = cleanString(value);
+    if (!normalizedProvider || !raw || raw.length > 8192 || raw.includes('\0')) return '';
+    if (normalizedProvider === 'codex') {
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== 'http:' || parsed.hostname !== 'localhost' || parsed.port !== '1455') return '';
+        if (parsed.username || parsed.password || parsed.pathname !== '/auth/callback' || parsed.hash) return '';
+        if (!hasSingleQueryValue(parsed, 'code') || !hasSingleQueryValue(parsed, 'state')) return '';
+        return raw;
+      } catch (_) {
+        return '';
+      }
+    }
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol === 'https:' && parsed.hostname === 'platform.claude.com' && !parsed.port
+          && !parsed.username && !parsed.password && parsed.pathname === '/oauth/code/callback' && !parsed.hash
+          && hasSingleQueryValue(parsed, 'code') && hasSingleQueryValue(parsed, 'state')) return raw;
+    } catch (_) {
+      // Claude also returns a compact authorizationCode#state value.
+    }
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(raw)) return '';
+    const separator = raw.indexOf('#');
+    if (separator < 1 || separator !== raw.lastIndexOf('#')) return '';
+    const code = raw.slice(0, separator);
+    const state = raw.slice(separator + 1);
+    if (!code || !state || /\s/.test(code) || /\s/.test(state)) return '';
+    return raw;
   }
 
   function secondsRemaining(expiresAt, now = Date.now()) {
@@ -184,6 +256,7 @@
     isTerminalAttempt,
     pollDelayMs,
     safeOfficialURL,
+    normalizeAuthorizationResponse,
     secondsRemaining,
     formatCountdown,
     shouldPoll,

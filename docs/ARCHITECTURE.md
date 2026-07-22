@@ -147,7 +147,7 @@ CLAUDE_CODE_OAUTH_TOKEN
 ANTHROPIC_BASE_URL
 ```
 
-默认模型通过 CLI 参数传入。未绑定 AccountProfile 时是 Workspace 默认模式，runner 保留 Workspace 已有的 Anthropic 凭据和 Base URL；绑定托管账号后才清理冲突变量，并只设置所选认证方式对应的变量。VibeDock 不实现第三方 OAuth 页面；`oauth_token` 只接收用户通过 Claude 官方工具获得的 setup-token。
+默认模型通过 CLI 参数传入。未绑定 AccountProfile 时是 Workspace 默认模式，runner 保留 Workspace 已有的 Anthropic 凭据和 Base URL；绑定托管账号后才清理冲突变量，并只设置所选认证方式对应的变量。VibeDock 不托管第三方 OAuth 页面；`login` 账号使用上文的 PKCE 编排，`oauth_token` 则只接收用户通过 Claude 官方工具获得的 setup-token。
 
 ## DirectAgentConfig
 
@@ -337,21 +337,23 @@ Account Secret 和 Direct Session Secret 共用同一 Keyring，但存储位置�
 
 ```text
 Account Center
-  ├─ Codex -> short-lived helper -> codex app-server device flow
-  └─ Claude -> short-lived helper -> ttyd -> claude auth login --claudeai
-                                      └─ claude auth status --json
+  ├─ Codex -> official authorize URL -> paste localhost callback
+  │                                    └─ one-shot helper -> token exchange -> auth.json
+  └─ Claude -> official authorize URL -> paste code#state
+                                       └─ one-shot helper -> token exchange -> .credentials.json
 ```
 
 - 每个账号最多一个活动尝试，全局最多三个 helper；默认 15 分钟过期；
-- 尝试只存在于控制面内存。设备 URL/代码、ttyd 密码、授权响应、Provider token 和凭据文件内容不会进入 Store、日志或浏览器存储；
+- 活动索引只存在于控制面内存，helper 的公开状态和私有 PKCE session 位于 credential volume，以便控制面重启后恢复；授权码、PKCE verifier、Provider token 和凭据内容不会进入 Store、日志或浏览器存储；
 - helper 只能使用固定 Workspace image、命令、凭据卷和资源限制；浏览器不能传入 image、command、mount、network、port、环境变量、Provider URL 或 Docker 参数；
-- Codex 使用 0.144.6 的结构化 `account/login/start`、completed/cancel 与 `account/read` 协议，并对官方 HTTPS URL 使用版本固定 allowlist；
-- Claude 使用 2.1.215 的官方 PTY 流程。控制面只提供同源、活动 attempt 限定的 ttyd 代理，不实现 Anthropic OAuth callback，也不解析终端输入；
-- 每次登录写入 `.auth-attempts/<account>/<attempt>` staging，官方 CLI 确认后才原子提升；取消、失败或过期不会覆盖已有稳定档案；
+- Codex 对齐 0.144.6 官方 browser PKCE 参数和 credential schema；只接受 `auth.openai.com/oauth/authorize`，只接受精确的 localhost callback，并校验 OAuth state；
+- Claude 对齐 2.1.215 的 PKCE 参数和 credential schema；只接受 `claude.com/cai/oauth/authorize`，并校验用户粘贴的 `authorizationCode#state`；
+- start、inspect、cancel、status 使用无网络的一次性 helper；只有 complete 的固定 token exchange 操作允许访问 Provider 网络，且 token endpoint 不允许重定向；
+- 每次登录写入 `.auth-attempts/<account>/<attempt>` staging，state 校验和 token 兑换成功后只原子替换认证文件；用户配置与 CLI 运行数据保持原位，取消、失败或过期不会覆盖已有稳定凭据；
 - 账号更新/删除采用 rename-to-quarantine、Store mutation、commit/rollback 三阶段清理，启动 reconcile 恢复未完成事务；
 - API 响应使用 `no-store`；mutation 需要 JSON、自定义请求头和 same-origin 检查。
 
-升级 Codex、Claude Code 或 ttyd 时，必须同步更新 helper capability、Codex 协议 fixture/官方 URL allowlist 和 Claude status fixture；不兼容时应 fail closed，而不是回退为任意终端文本解析。
+升级 Codex 或 Claude Code 时，必须同步核对 OAuth client contract、官方 URL allowlist、token exchange 和 credential schema fixture；不兼容时应 fail closed。
 
 ## 原生登录档案
 
@@ -378,7 +380,6 @@ Pi/OpenCode 不使用该卷作为账号目录，它们使用 Workspace Home 卷�
 /w/<workspace>/code/
 /w/<workspace>/terminal/<session>/
 /w/<workspace>/port/<port>/
-/auth/accounts/<account>/login-attempts/<attempt>/terminal/  # Claude login only
 ```
 
 控制面使用 Go `httputil.ReverseProxy` 转发 HTTP 和 WebSocket。Workspace 不通过随机宿主机端口暴露服务。
@@ -467,11 +468,11 @@ persist metadata
 
 - Workspace 拥有交互式终端，但镜像不安装 sudo，也不授予 `coder` 无密码提权；
 - Codex/Claude Workspace 与 auth helper 共享 Credential volume，并使用共同 UID 1001；这是可信单用户边界，不是租户隔离；
-- 原生 CLI credential files 由官方 CLI 管理，不经过 VibeDock AES-GCM field encryption；
+- 原生 credential files 由登录 helper 创建、由对应 CLI 消费和刷新，不经过 VibeDock AES-GCM field encryption；
 - 控制面 Basic Auth 关闭时，任何能访问可信网络控制面的人都可能启动登录或删除本地凭据；UI 会持续显示这一边界；
 - 同容器内 Session 使用同一 `coder` UID；
 - Docker socket 使控制面具备宿主机级能力；
-- 已获得 Workspace Shell 的用户可以读取该 Workspace 正在运行 Session 的内存凭据文件。
+- 已获得任一 Workspace Shell 的用户可读取共享 Credential volume 中所有托管 Codex/Claude 账号文件；还可读取同一 Workspace 正在运行 Session 的 `/dev/shm` 凭据文件。当前部署模型因此只适用于完全互信的单用户或小团队。
 
 加密主要防御：
 

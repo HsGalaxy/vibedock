@@ -114,7 +114,7 @@ function agentGlyph(agent) {
 }
 
 function authTypeLabel(type) {
-  return ({login:'网页登录 / 官方 CLI', api_key:'API Key', bearer_token:'Bearer Token', oauth_token:'Claude setup-token（非网页登录）'})[type] || type;
+  return ({login:'官方网页登录', api_key:'API Key', bearer_token:'Bearer Token', oauth_token:'Claude setup-token（非网页登录）'})[type] || type;
 }
 
 function formatDate(value) {
@@ -149,7 +149,7 @@ function accountLabel(session) {
 function isDirectAgent(agent) { return agent === 'pi' || agent === 'opencode'; }
 
 function authOptions(agent) {
-  const common = [['login','网页登录 / 官方 CLI'],['api_key','API Key'],['bearer_token','Bearer Token']];
+  const common = [['login','官方网页登录'],['api_key','API Key'],['bearer_token','Bearer Token']];
   if (agent === 'claude') common.push(['oauth_token','已有 Claude setup-token']);
   return common;
 }
@@ -1199,9 +1199,6 @@ function accountAuthRecord(accountID) { return state.accountAuth.get(accountID) 
 function authAPIOptions(method = 'POST', body = {}) {
   return {method, headers:{'Content-Type':'application/json', [AUTH_REQUEST_HEADER]:'account-auth'}, body:JSON.stringify(body)};
 }
-function terminalPath(accountID, attemptID) {
-  return `/auth/accounts/${encodeURIComponent(accountID)}/login-attempts/${encodeURIComponent(attemptID)}/terminal/`;
-}
 function updateControlAuthWarnings() {
   const disabled = !state.controlAuthEnabled;
   $('#accountAuthWarning')?.classList.toggle('hidden', !disabled);
@@ -1229,7 +1226,7 @@ function renderAccounts() {
     const nativeLogin = nativeLoginAccount(account);
     const record = accountAuthRecord(account.id);
     const status = accountAuth.authStatusPresentation(record.status);
-    const secretState = nativeLogin ? '由官方 CLI 管理' : account.has_secret ? `已保存 · ${escapeHTML(account.secret_hint || '••••')}` : '未配置';
+    const secretState = nativeLogin ? '账号独立凭据目录' : account.has_secret ? `已保存 · ${escapeHTML(account.secret_hint || '••••')}` : '未配置';
     return `<article class="account-card ${nativeLogin ? 'native-login-card' : ''}" data-account-card="${escapeHTML(account.id)}">
       <div class="account-card-head"><span class="session-agent ${escapeHTML(account.agent)}">${escapeHTML(agentGlyph(account.agent))}</span><div><h4>${escapeHTML(account.name)}</h4><small>${escapeHTML(agentLabel(account.agent))} · ${escapeHTML(authTypeLabel(account.auth_type))}</small></div>${nativeLogin ? `<span class="native-auth-badge ${escapeHTML(status.tone)}">${escapeHTML(status.label)}</span>` : `<span class="account-usage">${references} sessions</span>`}</div>
       <div class="account-details"><div><span>Endpoint</span><b>${escapeHTML(accountEndpoint(account))}</b></div><div><span>Model</span><b>${escapeHTML(account.model || 'provider 默认')}</b></div><div><span>Credential</span><b>${secretState}</b></div>${nativeLogin ? `<div><span>官方登录状态</span><b>${escapeHTML(record.message || status.label)}</b></div>` : `<div><span>Last used</span><b>${escapeHTML(formatDate(account.last_used_at))}</b></div>`}</div>
@@ -1341,7 +1338,7 @@ function populateAuthOptions(agent, selected = '') {
     const login = value === 'login';
     const setupToken = value === 'oauth_token';
     const description = login
-      ? (agent === 'codex' ? '使用 ChatGPT 与 OpenAI 官方设备页面' : '使用 Claude.ai 与 Claude Code 官方登录终端')
+      ? (agent === 'codex' ? '使用 ChatGPT 在 OpenAI 官方页面授权' : '使用 Claude.ai 在 Anthropic 官方页面授权')
       : setupToken ? '粘贴已由 Claude 官方 CLI 生成的 setup-token，不是网页登录'
       : value === 'api_key' ? '加密保存 Provider API Key' : '加密保存 Bearer Token';
     return `<button type="button" class="auth-method-option ${select.value === value ? 'selected' : ''} ${login ? 'official-login' : ''}" role="radio" aria-checked="${select.value === value}" data-auth-method="${escapeHTML(value)}"><b>${escapeHTML(label)}</b><small>${escapeHTML(description)}</small></button>`;
@@ -1366,12 +1363,12 @@ function updateAccountFormHints() {
   $('#accountSecretField').classList.toggle('hidden', isLogin);
   $('#accountBaseURLInput').disabled = isLogin;
   if (isLogin) $('#accountBaseURLInput').value = '';
-  $('#accountBaseURLHint').textContent = isLogin ? '网页登录 / 官方 CLI 使用 Provider 官方端点，不能自定义 Base URL。' : agent === 'codex' ? '留空使用 OpenAI 默认端点；自定义端点需要兼容 Responses API。' : '留空使用 Anthropic 官方 API。';
+  $('#accountBaseURLHint').textContent = isLogin ? '官方网页登录使用 Provider 官方端点，不能自定义 Base URL。' : agent === 'codex' ? '留空使用 OpenAI 默认端点；自定义端点需要兼容 Responses API。' : '留空使用 Anthropic 官方 API。';
   $('#accountSecretLabel').textContent = ({api_key:agent === 'claude' ? 'Anthropic API Key' : 'API Key', bearer_token:'Bearer Token', oauth_token:'已有 Claude setup-token'})[auth] || 'API Key / Token';
   $('#accountSecretHint').textContent = auth === 'oauth_token' ? '请先使用 Claude 官方 CLI 生成 setup-token，再粘贴到这里。setup-token 是 Token 导入，不是 Claude.ai 网页登录。' : '密钥仅会发送到当前 VibeDock 控制面，并加密保存。';
   $('#accountAuthMethodHint').textContent = isLogin
-    ? (agent === 'codex' ? '保存档案后将返回账号中心，并立即开始 ChatGPT / OpenAI 官方设备登录。' : '保存档案后将返回账号中心，并立即打开 Claude Code 官方登录终端。')
-    : auth === 'oauth_token' ? 'setup-token 不会启动 Claude.ai 登录。要网页登录，请选择“网页登录 / 官方 CLI”。' : '这类 API 凭据由 VibeDock 控制面加密保存。';
+    ? `保存档案后将返回账号中心，并立即进入 ${agent === 'codex' ? 'OpenAI' : 'Anthropic'} 官方登录流程。`
+    : auth === 'oauth_token' ? 'setup-token 不会启动 Claude.ai 登录。要网页登录，请选择“官方网页登录”。' : '这类 API 凭据由 VibeDock 控制面加密保存。';
 }
 function envMapToText(env = {}) { return Object.entries(env).sort(([a],[b]) => a.localeCompare(b)).map(([k,v]) => `${k}=${v}`).join('\n'); }
 function parseEnvText(text) {
@@ -1564,13 +1561,13 @@ async function probeAccount(id) {
       ready:'连接成功，凭据可用',
       auth_failed:`Provider 可访问，但凭据被拒绝${result.http_status ? `（HTTP ${result.http_status}）` : ''}`,
       reachable:`Provider 已响应${result.http_status ? `（HTTP ${result.http_status}）` : ''}，但未确认凭据可用`,
-      interactive:'需要在 Agent 终端内完成官方 CLI 登录',
+      interactive:'需要完成 Provider 官方网页登录',
       session_required:'请启动或重启绑定此账号的 Session 完成验证',
     };
     showToast(result.message || messages[result.status] || (result.ok ? '连接测试成功' : '连接测试未通过'));
   } catch (error) { showToast(error.message); }
 }
-async function deleteAccount(id) { const account = accountFor(id); if (!account || !confirm(`确定删除账号“${account.name}”？原生登录账号的本地 CLI 凭据也会被删除。`)) return; try { await api(`/api/accounts/${id}`, {method:'DELETE'}); state.accountAuth.delete(id); state.accounts = await api('/api/accounts'); renderAccounts(); showToast('账号配置已删除'); } catch (error) { showToast(error.message); } }
+async function deleteAccount(id) { const account = accountFor(id); if (!account || !confirm(`确定删除账号“${account.name}”？这个账号的本地登录凭据也会被删除。`)) return; try { await api(`/api/accounts/${id}`, {method:'DELETE'}); state.accountAuth.delete(id); state.accounts = await api('/api/accounts'); renderAccounts(); showToast('账号配置已删除'); } catch (error) { showToast(error.message); } }
 
 function selectNativeLoginAccount(agent) {
   const matches = state.accounts.filter(account => account.agent === agent && account.auth_type === 'login');
@@ -1593,22 +1590,40 @@ function clearAuthTimers() {
   authPollTimer = 0;
   authCountdownTimer = 0;
 }
-function setSensitiveText(element, value = '') {
-  if (element) element.textContent = value;
-}
+function authProviderSuffix(provider) { return provider === 'claude' ? 'Claude' : 'Codex'; }
+function authorizationResponseInput(provider) { return $(`#${provider}AuthorizationResponse`); }
+function authorizationCompleteButton(provider) { return $(`#complete${authProviderSuffix(provider)}Login`); }
+function authorizationOfficialButton(provider) { return $(`#open${authProviderSuffix(provider)}OfficialPage`); }
 function clearSensitiveAttemptUI(provider) {
-  if (provider === 'codex') {
-    setSensitiveText($('#codexDeviceCode'), '—');
-    $('#openCodexOfficialPage').dataset.url = '';
-    $('#openCodexOfficialPage').disabled = true;
-    $('#copyCodexCode').disabled = true;
+  const input = authorizationResponseInput(provider);
+  const openButton = authorizationOfficialButton(provider);
+  const completeButton = authorizationCompleteButton(provider);
+  if (input) {
+    input.value = '';
+    input.disabled = true;
+    input.setAttribute('aria-invalid', 'false');
   }
-  if (provider === 'claude') {
-    const frame = $('#claudeLoginTerminal');
-    frame.removeAttribute('src');
-    frame.hidden = true;
-    $('#claudeTerminalPlaceholder').classList.remove('hidden');
+  if (openButton) {
+    openButton.dataset.url = '';
+    openButton.disabled = true;
   }
+  if (completeButton) completeButton.disabled = true;
+}
+function syncAuthorizationControls(provider, attempt) {
+  const input = authorizationResponseInput(provider);
+  const openButton = authorizationOfficialButton(provider);
+  const completeButton = authorizationCompleteButton(provider);
+  const awaitingResponse = attempt.state === 'awaiting_user';
+  const officialURL = accountAuth.safeOfficialURL(attempt.verificationURL, provider);
+  if (openButton) {
+    openButton.dataset.url = officialURL;
+    openButton.disabled = !officialURL || !awaitingResponse;
+  }
+  if (!input || !completeButton) return;
+  const response = accountAuth.normalizeAuthorizationResponse(provider, input.value);
+  input.disabled = !awaitingResponse;
+  input.setAttribute('aria-invalid', String(Boolean(input.value.trim()) && !response));
+  completeButton.disabled = !awaitingResponse || !response;
 }
 function renderAuthAttempt(attempt) {
   if (!state.activeAuth || state.activeAuth.accountID !== attempt.accountID || state.activeAuth.attemptID !== attempt.id) return;
@@ -1625,22 +1640,15 @@ function renderAuthAttempt(attempt) {
   errorElement.textContent = errorMessage;
   errorElement.classList.toggle('hidden', !errorMessage);
   cancelButton.classList.toggle('hidden', terminal);
+  cancelButton.disabled = attempt.state === 'verifying';
   retryButton.classList.toggle('hidden', !terminal || attempt.state === 'completed');
-  if (provider === 'codex') {
-    const officialURL = accountAuth.safeOfficialURL(attempt.verificationURL);
-    setSensitiveText($('#codexDeviceCode'), attempt.userCode || (terminal ? '—' : '等待官方 CLI…'));
-    $('#copyCodexCode').disabled = !attempt.userCode || terminal;
-    $('#openCodexOfficialPage').dataset.url = officialURL;
-    $('#openCodexOfficialPage').disabled = !officialURL || terminal;
-  } else if (!terminal) {
-    const frame = $('#claudeLoginTerminal');
-    if (!frame.src && attempt.id) frame.src = terminalPath(attempt.accountID, attempt.id);
-    frame.hidden = false;
-    $('#claudeTerminalPlaceholder').classList.add('hidden');
-  }
+  syncAuthorizationControls(provider, attempt);
   if (terminal) {
     clearSensitiveAttemptUI(provider);
     clearTimeout(authPollTimer);
+    clearInterval(authCountdownTimer);
+    authPollTimer = 0;
+    authCountdownTimer = 0;
     renderAccounts();
     void refreshNativeAuthStatuses();
   }
@@ -1659,27 +1667,83 @@ function scheduleAuthPoll(delay) {
 }
 async function pollActiveAuthAttempt() {
   const active = state.activeAuth;
-  if (!active || document.hidden || !currentAuthDialog()?.open || !accountAuth.isActiveAttempt(active.attempt?.state)) return;
+  if (!active || active.completing || document.hidden || !currentAuthDialog()?.open || !accountAuth.isActiveAttempt(active.attempt?.state)) return;
   try {
     const payload = await api(`/api/accounts/${active.accountID}/login-attempts/${active.attemptID}`, {timeout:15000});
-    if (state.activeAuth !== active) return;
+    if (state.activeAuth !== active || active.completing) return;
     const attempt = accountAuth.normalizeAttempt(payload, active);
     renderAuthAttempt(attempt);
     scheduleAuthPoll(attempt.pollAfterMs);
   } catch (error) {
     if (state.activeAuth !== active) return;
+    if (error.status === 404 || error.status === 410) {
+      await refreshNativeAuthStatuses();
+      if (state.activeAuth !== active) return;
+      const authenticated = accountAuthRecord(active.accountID).status === 'authenticated';
+      renderAuthAttempt({
+        ...active.attempt,
+        id:active.attemptID,
+        accountID:active.accountID,
+        provider:active.provider,
+        state:authenticated ? 'completed' : 'expired',
+        verificationURL:'',
+        message:authenticated ? '登录完成，凭据已保存' : '登录状态已过期，请重新开始',
+      });
+      if (authenticated) showToast('登录完成；绑定此账号的 Session 将使用新凭据');
+      return;
+    }
     const errorElement = $(`#${active.provider}LoginError`);
     errorElement.textContent = error.message;
     errorElement.classList.remove('hidden');
     scheduleAuthPoll(3000);
   }
 }
+async function completeAccountLogin(provider) {
+  const active = state.activeAuth;
+  if (!active || active.completing || active.provider !== provider || active.attempt?.state !== 'awaiting_user') return;
+  const input = authorizationResponseInput(provider);
+  const authorizationResponse = accountAuth.normalizeAuthorizationResponse(provider, input?.value);
+  if (!authorizationResponse) {
+    if (input) input.setAttribute('aria-invalid', 'true');
+    const errorElement = $(`#${provider}LoginError`);
+    errorElement.textContent = provider === 'codex'
+      ? '请粘贴 OpenAI 返回的完整 localhost 回调地址。'
+      : '请粘贴完整的 authorizationCode#state 授权响应。';
+    errorElement.classList.remove('hidden');
+    input?.focus();
+    return;
+  }
+  clearTimeout(authPollTimer);
+  const pendingAttempt = active.attempt;
+  active.completing = true;
+  renderAuthAttempt({...pendingAttempt, state:'verifying', message:'正在校验授权响应并保存凭据…'});
+  try {
+    const payload = await api(`/api/accounts/${active.accountID}/login-attempts/${active.attemptID}/complete`, {
+      ...authAPIOptions('POST', {authorization_response:authorizationResponse}),
+      timeout:90000,
+    });
+    if (state.activeAuth !== active) return;
+    active.completing = false;
+    const attempt = accountAuth.normalizeAttempt(payload, {id:active.attemptID, accountID:active.accountID, provider:active.provider, state:'verifying'});
+    renderAuthAttempt(attempt);
+    if (attempt.state === 'completed') showToast('登录完成；绑定此账号的 Session 将使用新凭据');
+    else scheduleAuthPoll(attempt.pollAfterMs);
+  } catch (error) {
+    if (state.activeAuth !== active) return;
+    active.completing = false;
+    renderAuthAttempt(pendingAttempt);
+    const errorElement = $(`#${provider}LoginError`);
+    errorElement.textContent = error.message;
+    errorElement.classList.remove('hidden');
+    scheduleAuthPoll(2000);
+  }
+}
 function openAuthDialog(account, attempt) {
   clearAuthTimers();
   const normalized = accountAuth.normalizeAttempt(attempt, {accountID:account.id, provider:account.agent});
   if (!normalized.id) throw new Error('登录服务没有返回 attempt_id');
+  clearSensitiveAttemptUI(account.agent);
   state.activeAuth = {accountID:account.id, attemptID:normalized.id, provider:account.agent, account, attempt:normalized};
-  const providerName = account.agent === 'codex' ? 'Codex' : 'Claude';
   $(`#${account.agent}LoginAccountName`).textContent = account.name;
   $(`#${account.agent}LoginError`).textContent = '';
   $(`#${account.agent}LoginError`).classList.add('hidden');
@@ -1694,7 +1758,7 @@ function openAuthDialog(account, attempt) {
 }
 async function startAccountLogin(accountID) {
   const account = accountFor(accountID);
-  if (!nativeLoginAccount(account)) return showToast('只有 Codex / Claude 原生登录账号可以使用官方登录');
+  if (!nativeLoginAccount(account)) return showToast('只有 Codex / Claude 网页登录账号可以使用官方登录');
   try {
     const payload = await api(`/api/accounts/${account.id}/login-attempts`, authAPIOptions('POST', {}));
     const attempt = accountAuth.normalizeAttempt(payload, {accountID:account.id, provider:account.agent});
@@ -1731,10 +1795,10 @@ async function cancelAccountLogin(accountID, attemptID = '') {
 }
 async function logoutAccount(accountID) {
   const account = accountFor(accountID);
-  if (!nativeLoginAccount(account) || !confirm(`退出“${account.name}”的官方 CLI 登录？这会删除 VibeDock 中的本地登录凭据；Provider 远端会话是否已撤销取决于官方 CLI。`)) return;
+  if (!nativeLoginAccount(account) || !confirm(`退出“${account.name}”的网页登录？这会删除 VibeDock 中的本地登录凭据，但不会保证撤销 Provider 端的其他会话。`)) return;
   try {
     const result = await api(`/api/accounts/${accountID}/logout`, authAPIOptions('POST', {}));
-    state.accountAuth.set(accountID, {status:'unauthenticated', attemptID:'', attemptState:'', message:result?.provider_logout === 'unconfirmed' ? '本地凭据已删除；远端撤销未确认' : '已退出本地官方 CLI 登录'});
+    state.accountAuth.set(accountID, {status:'unauthenticated', attemptID:'', attemptState:'', message:result?.provider_logout === 'unconfirmed' ? '本地凭据已删除；远端撤销未确认' : '已退出网页登录'});
     renderAccounts();
     showToast(result?.provider_logout === 'unconfirmed' ? '本地凭据已删除；Provider 远端撤销未确认' : '已退出登录');
   } catch (error) { showToast(error.message); }
@@ -1940,16 +2004,23 @@ $('#cancelCodexLogin').onclick = () => state.activeAuth?.provider === 'codex' &&
 $('#cancelClaudeLogin').onclick = () => state.activeAuth?.provider === 'claude' && cancelAccountLogin(state.activeAuth.accountID, state.activeAuth.attemptID);
 $('#retryCodexLogin').onclick = () => retryActiveAuth('codex');
 $('#retryClaudeLogin').onclick = () => retryActiveAuth('claude');
-$('#copyCodexCode').onclick = async () => {
-  const code = state.activeAuth?.provider === 'codex' ? state.activeAuth.attempt?.userCode : '';
-  if (!code) return;
-  try { await navigator.clipboard.writeText(code); showToast('设备代码已复制'); }
-  catch (_) { showToast('无法自动复制，请选中代码后手动复制'); }
-};
-$('#openCodexOfficialPage').onclick = event => {
-  const url = accountAuth.safeOfficialURL(event.currentTarget.dataset.url);
-  if (url) window.open(url, '_blank', 'noopener,noreferrer');
-};
+for (const provider of ['codex','claude']) {
+  authorizationOfficialButton(provider).onclick = event => {
+    const url = accountAuth.safeOfficialURL(event.currentTarget.dataset.url, provider);
+    if (url) window.open(url, '_blank', 'noopener,noreferrer');
+  };
+  const responseInput = authorizationResponseInput(provider);
+  responseInput.addEventListener('input', () => {
+    if (state.activeAuth?.provider === provider) syncAuthorizationControls(provider, state.activeAuth.attempt);
+  });
+  responseInput.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      void completeAccountLogin(provider);
+    }
+  });
+  authorizationCompleteButton(provider).onclick = () => completeAccountLogin(provider);
+}
 $('#createAddAccountButton').onclick = () => openAccountEditor(null, {returnTo:'create', agent:$('#createAgentInput').value});
 $('#sessionAddAccountButton').onclick = () => openAccountEditor(null, {returnTo:'session', agent:$('#sessionAgentInput').value});
 $('#accountAgentInput').onchange = () => populateAuthOptions($('#accountAgentInput').value, $('#accountAuthInput').value);

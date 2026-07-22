@@ -52,6 +52,11 @@ type AuthStartRequest struct {
 	ExpiresAt time.Time
 }
 
+type AuthCompleteRequest struct {
+	AuthAttemptRef
+	AuthorizationResponse string
+}
+
 type AuthRuntimeAttempt struct {
 	AuthAttemptRef
 	State             AuthAttemptState
@@ -86,12 +91,6 @@ type AuthLogoutResult struct {
 	Message                 string
 }
 
-type AuthTerminalTarget struct {
-	URL      string
-	Username string
-	Password string `json:"-"`
-}
-
 type AuthCredentialCleanup struct {
 	AccountID string
 	CleanupID string
@@ -99,11 +98,11 @@ type AuthCredentialCleanup struct {
 
 type AuthRuntime interface {
 	StartAuth(Context, AuthStartRequest) (AuthRuntimeAttempt, error)
+	CompleteAuth(Context, AuthCompleteRequest) (AuthRuntimeAttempt, error)
 	InspectAuth(Context, AuthAttemptRef) (AuthRuntimeAttempt, error)
 	CancelAuth(Context, AuthAttemptRef) error
 	AuthStatus(Context, AuthStatusRequest) (AuthStatusResult, error)
 	LogoutAuth(Context, AuthLogoutRequest) (AuthLogoutResult, error)
-	AuthTerminal(Context, AuthAttemptRef) (AuthTerminalTarget, error)
 	PrepareAuthCredentialCleanup(Context, string) (AuthCredentialCleanup, error)
 	CommitAuthCredentialCleanup(Context, AuthCredentialCleanup) error
 	RollbackAuthCredentialCleanup(Context, AuthCredentialCleanup) error

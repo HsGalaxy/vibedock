@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,7 @@ func protocolResponseScript(extra string) string {
 	return `
 printf '%s\n' "$*" >>"$COMMAND_LOG"
 case "$*" in
+  *"/vibedock/credentials/.vibedock-initialized") exit 0 ;;
   *" protocol") printf '%s\n' '{"protocol":1,"codex_version":"0.144.6","claude_version":"2.1.215","ttyd_version":"1.7.7"}'; exit 0 ;;
 esac
 ` + extra
@@ -48,17 +50,62 @@ func readCommands(t *testing.T, path string) string {
 	return string(value)
 }
 
-func TestStartAuthUsesFixedHardenedContainer(t *testing.T) {
+func authorizationURLForTest(provider model.AuthProvider) string {
+	values := url.Values{
+		"response_type":         {"code"},
+		"code_challenge_method": {"S256"},
+		"state":                 {"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"},
+		"code_challenge":        {"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"},
+	}
+	base := ""
+	if provider == model.AuthProviderCodex {
+		base = "https://auth.openai.com/oauth/authorize"
+		values.Set("client_id", codexOAuthClientID)
+		values.Set("redirect_uri", codexOAuthRedirectURI)
+		values.Set("scope", codexOAuthScopes)
+		values.Set("id_token_add_organizations", "true")
+		values.Set("codex_cli_simplified_flow", "true")
+		values.Set("originator", "codex_cli_rs")
+	} else {
+		base = "https://claude.com/cai/oauth/authorize"
+		values.Set("client_id", claudeOAuthClientID)
+		values.Set("redirect_uri", claudeOAuthRedirectURI)
+		values.Set("scope", claudeOAuthScopes)
+		values.Set("code", "true")
+	}
+	return base + "?" + values.Encode()
+}
+
+func TestValidateAuthorizationURLAllowsOnlyCanonicalProviderRoutes(t *testing.T) {
+	for _, provider := range []model.AuthProvider{model.AuthProviderCodex, model.AuthProviderClaude} {
+		if err := validateAuthorizationURL(provider, authorizationURLForTest(provider)); err != nil {
+			t.Fatalf("valid %s URL rejected: %v", provider, err)
+		}
+	}
+	codexURL := authorizationURLForTest(model.AuthProviderCodex)
+	invalid := []string{
+		strings.Replace(codexURL, "auth.openai.com", "login.example.com", 1),
+		codexURL + "&state=duplicate",
+		strings.Replace(codexURL, "scope=", "missing_scope=", 1),
+	}
+	for _, value := range invalid {
+		if err := validateAuthorizationURL(model.AuthProviderCodex, value); err == nil {
+			t.Fatalf("unsafe authorization URL accepted: %s", value)
+		}
+	}
+	if err := validateAuthorizationURL(model.AuthProviderClaude, codexURL); err == nil {
+		t.Fatal("provider-mismatched authorization URL accepted")
+	}
+}
+
+func TestStartAuthUsesHardenedOneShotHelper(t *testing.T) {
 	expires := time.Now().UTC().Add(10 * time.Minute).Unix()
 	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
 case "$1" in
-  network) exit 0 ;;
   volume) printf '%s\n' 'vibedock-credentials'; exit 0 ;;
-  create) printf '%s\n' 'container-id'; exit 0 ;;
-  start) exit 0 ;;
   run)
     case "$*" in
-      *" inspect "*) printf '%s\n' '{"protocol":1,"account_id":"account12345","attempt_id":"attempt12345678901234567","provider":"codex","state":"awaiting_user","verification_url":"https://auth.openai.com/codex/device","user_code":"CODE-123","expires_at":`+strconv.FormatInt(expires, 10)+`,"poll_after_ms":2000,"error_code":"","message":"waiting","terminal_available":false}'; exit 0 ;;
+      *" login "*) printf '%s\n' '{"protocol":1,"account_id":"account12345","attempt_id":"attempt12345678901234567","provider":"codex","state":"awaiting_user","verification_url":"https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&response_type=code&scope=openid+profile+email+offline_access+api.connectors.read+api.connectors.invoke&code_challenge_method=S256&state=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ&code_challenge=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=codex_cli_rs","user_code":"","expires_at":`+strconv.FormatInt(expires, 10)+`,"poll_after_ms":2000,"error_code":"","message":"waiting","terminal_available":false}'; exit 0 ;;
     esac ;;
 esac
 exit 1
@@ -69,13 +116,28 @@ exit 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attempt.State != model.AuthAttemptAwaitingUser || attempt.UserCode != "CODE-123" {
+	if attempt.State != model.AuthAttemptAwaitingUser || !strings.HasPrefix(attempt.VerificationURL, "https://auth.openai.com/oauth/authorize?") {
 		t.Fatalf("unexpected attempt: %#v", attempt)
 	}
 	commands := readCommands(t, logPath)
 	for _, expected := range []string{
-		"--name vibedock-auth-" + testAuthAttempt,
-		"--network vibedock",
+		"run --rm --network none --user 0:0 --read-only --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER",
+		"--pids-limit 32 --cpus 0.25 --memory 64m --restart no --log-driver none",
+		"--entrypoint /bin/sh vibedock/workspace:local -ec if [ ! -L /vibedock/credentials/.vibedock-initialized ] && [ -f /vibedock/credentials/.vibedock-initialized ]",
+		"$(/usr/bin/stat -c %u:%g:%a /vibedock/credentials)",
+		"temporary=$(/usr/bin/mktemp /vibedock/credentials/.vibedock-initializing.XXXXXX)",
+		"/usr/bin/mv -f \"$temporary\" /vibedock/credentials/.vibedock-initialized",
+	} {
+		if !strings.Contains(commands, expected) {
+			t.Fatalf("credential volume initializer missing %q:\n%s", expected, commands)
+		}
+	}
+	initializationArgs := strings.Join(authVolumeInitializationArgs(), " ")
+	if strings.Contains(initializationArgs, "chown 0:0") || strings.Index(initializationArgs, "chmod 0700 /vibedock/credentials") > strings.Index(initializationArgs, "mktemp /vibedock/credentials/.vibedock-initializing") || strings.Index(initializationArgs, "mktemp /vibedock/credentials/.vibedock-initializing") > strings.Index(initializationArgs, "mv -f") {
+		t.Fatalf("credential initializer cannot recover safely from a partial run: %s", initializationArgs)
+	}
+	for _, expected := range []string{
+		"run --rm --network none",
 		"--user 1001:1001",
 		"--read-only",
 		"--cap-drop ALL",
@@ -88,26 +150,28 @@ exit 1
 		"type=volume,src=vibedock-credentials,dst=/vibedock/credentials",
 		"--entrypoint /usr/local/bin/vibedock-auth-helper",
 		"vibedock/workspace:local login --provider codex",
-		"--label vibedock.auth_helper=true",
-		"--label vibedock.auth_account=" + testAuthAccount,
-		"--label vibedock.auth_attempt=" + testAuthAttempt,
+		"--account " + testAuthAccount,
+		"--attempt " + testAuthAttempt,
 	} {
 		if !strings.Contains(commands, expected) {
 			t.Fatalf("missing fixed argument %q in:\n%s", expected, commands)
 		}
 	}
-	for _, forbidden := range []string{"-p ", "--publish", "/var/run/docker.sock", "vibedock-ws-", "vibedock-home-", ":/workspace"} {
+	for _, forbidden := range []string{"--privileged", "--name vibedock-auth-", " start ", " exec ", "--label vibedock.auth_", "-p ", "--publish", "/var/run/docker.sock", "vibedock-ws-", "vibedock-home-", ":/workspace"} {
 		if strings.Contains(commands, forbidden) {
 			t.Fatalf("found forbidden argument %q in:\n%s", forbidden, commands)
 		}
 	}
 }
 
-func TestStartAuthErrorDoesNotExposeTerminalPasswordOrProviderOutput(t *testing.T) {
+func TestStartAuthErrorDoesNotExposeProviderOutput(t *testing.T) {
 	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
 case "$1" in
-  network|volume) exit 0 ;;
-  create) printf '%s\n' 'provider-device-CODE-SECRET' >&2; exit 1 ;;
+  volume) exit 0 ;;
+  run)
+    case "$*" in
+      *" login "*) printf '%s\n' 'provider-authorization-CODE-SECRET' >&2; exit 1 ;;
+    esac ;;
 esac
 exit 1
 `))
@@ -115,24 +179,21 @@ exit 1
 	request := model.AuthStartRequest{AuthAttemptRef: model.AuthAttemptRef{AccountID: testAuthAccount, AttemptID: testAuthAttempt, Provider: model.AuthProviderClaude}, ExpiresAt: time.Now().UTC().Add(10 * time.Minute)}
 	_, err := runtime.StartAuth(context.Background(), request)
 	if err == nil {
-		t.Fatal("expected helper create failure")
+		t.Fatal("expected helper login failure")
 	}
 	if strings.Contains(err.Error(), "CODE-SECRET") {
 		t.Fatalf("provider output leaked: %v", err)
 	}
 	commands := readCommands(t, logPath)
-	if strings.Contains(commands, "VIBEDOCK_AUTH_TERMINAL_PASSWORD=") {
-		t.Fatalf("terminal credential must not enter Docker container metadata: %s", commands)
-	}
-	if strings.Contains(err.Error(), "VIBEDOCK_AUTH_TERMINAL_PASSWORD") {
-		t.Fatalf("terminal credential argument leaked through error: %v", err)
+	if strings.Contains(commands, "CODE-SECRET") {
+		t.Fatalf("provider output entered Docker command metadata: %s", commands)
 	}
 }
 
-func TestAuthStatusUsesFixedOfficialStatusHelper(t *testing.T) {
+func TestAuthStatusUsesOfflineCredentialInspection(t *testing.T) {
 	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
 case "$1" in
-  network|volume) exit 0 ;;
+  volume) exit 0 ;;
   run)
     case "$*" in
       *" status "*) printf '%s\n' '{"protocol":1,"status":"authenticated","checked_at":1700000000,"message":"checked"}'; exit 0 ;;
@@ -149,21 +210,83 @@ exit 1
 		t.Fatalf("unexpected status: %#v", result)
 	}
 	commands := readCommands(t, logPath)
-	for _, expected := range []string{"status --provider claude --account " + testAuthAccount, "--label vibedock.auth_operation=status", "--label vibedock.auth_account=" + testAuthAccount, "--label vibedock.auth_provider=claude"} {
+	for _, expected := range []string{"status --provider claude --account " + testAuthAccount, "run --rm --network none"} {
 		if !strings.Contains(commands, expected) {
 			t.Fatalf("missing fixed status argument %q: %s", expected, commands)
 		}
 	}
+	if strings.Contains(commands, "network inspect") || strings.Contains(commands, "--label vibedock.auth_operation=status") {
+		t.Fatalf("status unexpectedly required network or a long-running helper: %s", commands)
+	}
+}
+
+func TestCompleteAuthPassesCallbackOnlyOnStdin(t *testing.T) {
+	expires := time.Now().UTC().Add(10 * time.Minute).Unix()
+	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
+case "$1" in
+  network|volume) exit 0 ;;
+  run)
+    case "$*" in
+      *" complete "*) printf '%s\n' '{"protocol":1,"account_id":"account12345","attempt_id":"attempt12345678901234567","provider":"codex","state":"completed","verification_url":"","user_code":"","expires_at":`+strconv.FormatInt(expires, 10)+`,"poll_after_ms":2000,"error_code":"","message":"completed","terminal_available":false}'; exit 0 ;;
+    esac ;;
+esac
+exit 1
+`))
+	runtime := New(docker, "vibedock")
+	callback := "http://localhost:1455/auth/callback?code=provider-secret&state=oauth-state"
+	request := model.AuthCompleteRequest{
+		AuthAttemptRef:        model.AuthAttemptRef{AccountID: testAuthAccount, AttemptID: testAuthAttempt, Provider: model.AuthProviderCodex},
+		AuthorizationResponse: callback,
+	}
+	attempt, err := runtime.CompleteAuth(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.State != model.AuthAttemptCompleted {
+		t.Fatalf("unexpected attempt: %#v", attempt)
+	}
+	commands := readCommands(t, logPath)
+	if !strings.Contains(commands, "run --rm -i --network vibedock") || !strings.Contains(commands, "complete --provider codex --account "+testAuthAccount+" --attempt "+testAuthAttempt) {
+		t.Fatalf("unexpected completion command: %s", commands)
+	}
+	if strings.Contains(commands, "provider-secret") || strings.Contains(commands, "oauth-state") {
+		t.Fatalf("authorization response leaked into Docker arguments: %s", commands)
+	}
+}
+
+func TestCancelAuthUsesOneShotHelper(t *testing.T) {
+	expires := time.Now().UTC().Add(10 * time.Minute).Unix()
+	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
+case "$1" in
+  volume) exit 0 ;;
+  run)
+    case "$*" in
+      *" cancel "*) printf '%s\n' '{"protocol":1,"account_id":"account12345","attempt_id":"attempt12345678901234567","provider":"claude","state":"cancelled","verification_url":"","user_code":"","expires_at":`+strconv.FormatInt(expires, 10)+`,"poll_after_ms":2000,"error_code":"","message":"cancelled","terminal_available":false}'; exit 0 ;;
+    esac ;;
+esac
+exit 1
+`))
+	runtime := New(docker, "vibedock")
+	ref := model.AuthAttemptRef{AccountID: testAuthAccount, AttemptID: testAuthAttempt, Provider: model.AuthProviderClaude}
+	if err := runtime.CancelAuth(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	commands := readCommands(t, logPath)
+	if !strings.Contains(commands, "cancel --provider claude --account "+testAuthAccount+" --attempt "+testAuthAttempt) || strings.Contains(commands, "stop --time") || strings.Contains(commands, "rm -f vibedock-auth-") {
+		t.Fatalf("cancel did not use one-shot helper: %s", commands)
+	}
 }
 
 func TestAccountConfigWriteKeepsHelperStdinAttached(t *testing.T) {
-	script := `
-printf '%s\n' "$*" >>"$COMMAND_LOG"
+	script := protocolResponseScript(`
+case "$1" in
+  volume) printf '%s\n' 'vibedock-credentials'; exit 0 ;;
+esac
 case "$*" in
   *" config-write "*) printf '%s\n' '{"protocol":1,"path":"config.toml","exists":true,"content":"ok"}'; exit 0 ;;
 esac
 exit 1
-`
+`)
 	docker, logPath := writeAuthDocker(t, script)
 	runtime := New(docker, "vibedock")
 	document, err := runtime.WriteAccountConfig(context.Background(), testAuthAccount, model.AuthProviderCodex, "config.toml", "model = \"gpt-test\"\n")
@@ -176,6 +299,9 @@ exit 1
 	commands := readCommands(t, logPath)
 	if !strings.Contains(commands, "run --rm -i") {
 		t.Fatalf("config write did not attach stdin: %s", commands)
+	}
+	if !strings.Contains(commands, "volume create vibedock-credentials") || !strings.Contains(commands, "--entrypoint /bin/sh vibedock/workspace:local -ec if [ ! -L /vibedock/credentials/.vibedock-initialized ]") || !strings.Contains(commands, ".vibedock-initialized") {
+		t.Fatalf("config write did not initialize fresh credential storage: %s", commands)
 	}
 }
 
@@ -244,26 +370,5 @@ exit 1
 		if strings.Contains(commands, forbidden) {
 			t.Fatalf("reconciliation targeted forbidden object %q: %s", forbidden, commands)
 		}
-	}
-}
-
-func TestAuthTerminalRequiresMatchingLabelsAndMemorySecret(t *testing.T) {
-	docker, _ := writeAuthDocker(t, `
-printf '%s\n' "$*" >>"$COMMAND_LOG"
-case "$1" in
-  inspect) printf '%s\n' '[{"State":{"Status":"running","Running":true},"Config":{"Labels":{"vibedock.managed":"true","vibedock.auth_helper":"true","vibedock.auth_account":"account12345","vibedock.auth_attempt":"attempt12345678901234567","vibedock.auth_provider":"claude","vibedock.auth_protocol":"1"}},"NetworkSettings":{"Networks":{"vibedock":{"IPAddress":"172.30.0.8"}}}}]'; exit 0 ;;
-esac
-exit 1
-`)
-	ref := model.AuthAttemptRef{AccountID: testAuthAccount, AttemptID: testAuthAttempt, Provider: model.AuthProviderClaude}
-	authTerminalSecrets.Store(authSecretKey(ref), "memory-only-password")
-	defer authTerminalSecrets.Delete(authSecretKey(ref))
-	runtime := New(docker, "vibedock")
-	target, err := runtime.AuthTerminal(context.Background(), ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if target.URL != "http://172.30.0.8:7681" || target.Username != "vibe" || target.Password != "memory-only-password" {
-		t.Fatalf("unexpected terminal target: %#v", target)
 	}
 }

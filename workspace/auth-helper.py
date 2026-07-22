@@ -8,23 +8,24 @@ output is never copied to this process' stderr or to the Docker log stream.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
-import selectors
-import signal
 import stat
-import subprocess
 import sys
 import tempfile
-import threading
 import time
-from typing import Any, BinaryIO, Iterator
-from urllib.parse import urlsplit
+from typing import Any, Iterator
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
     import tomllib
@@ -36,28 +37,47 @@ CODEX_VERSION = "0.144.6"
 CLAUDE_VERSION = "2.1.215"
 TTYD_VERSION = "1.7.7"
 CREDENTIALS_ROOT = Path("/vibedock/credentials")
-HELPER_PATH = "/usr/local/bin/vibedock-auth-helper"
-TTYD_PATH = "/usr/local/bin/ttyd"
-TTYD_PORT = 7681
-MAX_MESSAGE_BYTES = 1 << 20
-MAX_STATE_BYTES = 64 << 10
+MAX_STATE_BYTES = 256 << 10
 ACCOUNT_RE = re.compile(r"^[a-z0-9]{12}$")
 ATTEMPT_RE = re.compile(r"^[a-z0-9]{24}$")
 CLEANUP_RE = re.compile(r"^[a-z0-9]{32}$")
-USER_CODE_RE = re.compile(r"^[A-Z0-9-]{4,32}$")
 PROVIDERS = {"codex", "claude"}
 CONFIG_FILES = {"codex": ("config.toml",), "claude": ("settings.json",)}
 MAX_CONFIG_BYTES = 256 << 10
+MAX_AUTH_RESPONSE_BYTES = 8192
 TERMINAL_STATES = {"completed", "cancelled", "expired", "failed"}
-OFFICIAL_CODEX_URLS = {("auth.openai.com", "/codex/device")}
+VERIFYING_TTL_SECONDS = 75
+TERMINAL_RETENTION_SECONDS = 10 * 60
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback"
+CODEX_OAUTH_SCOPES = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+CLAUDE_OAUTH_SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+AUTHORIZATION_URLS = {
+    "codex": ("auth.openai.com", "/oauth/authorize"),
+    "claude": ("claude.com", "/cai/oauth/authorize"),
+}
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, _request, _file, _code, _message, _headers, _new_url):
+        return None
+
+
+TOKEN_OPENER = build_opener(_RejectRedirects)
 GENERIC_MESSAGES = {
-    "starting": "Official login helper is starting",
-    "awaiting_user": "Waiting for official provider login",
-    "verifying": "Verifying login with the official CLI",
-    "completed": "Official CLI login verified",
+    "starting": "Preparing official authorization",
+    "awaiting_user": "Waiting for the official authorization response",
+    "verifying": "Exchanging the authorization response",
+    "completed": "Official authorization completed",
     "cancelled": "Login cancelled",
     "expired": "Login expired",
-    "failed": "Official login helper failed",
+    "failed": "Official authorization failed",
 }
 
 
@@ -177,6 +197,17 @@ def _assert_tree_safe(root: Path, path: Path) -> None:
                 raise HelperError("unsafe_credentials_path")
             if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
                 raise HelperError("unsafe_credentials_path")
+
+
+def _assert_directory_entry(root: Path, path: Path) -> None:
+    """Validate the directory itself without following provider-owned children."""
+    _assert_components(root, path, allow_leaf_symlink=True)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise HelperError("credentials_missing") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise HelperError("unsafe_credentials_path")
 
 
 def _remove_entry_at(parent: int, name: str) -> None:
@@ -378,6 +409,7 @@ def paths(root: Path, account: str, attempt: str, provider: str) -> dict[str, Pa
         "stable": root / account / provider,
         "cancel": base / "cancel",
         "claim": base / "claude.claim",
+        "oauth": base / "oauth.json",
         "lock": base / "operation.lock",
     }
     for item in result.values():
@@ -421,264 +453,24 @@ def update_state(root: Path, path: Path, state: dict[str, Any], status: str, **f
     state["state"] = status
     state["message"] = GENERIC_MESSAGES[status]
     state.update(fields)
-    if status in TERMINAL_STATES:
+    if status != "awaiting_user":
         state["verification_url"] = ""
         state["user_code"] = ""
+    if status in TERMINAL_STATES:
         state["terminal_available"] = False
     _atomic_json(root, path, state)
 
 
-def validate_codex_url(value: str) -> str:
-    if not isinstance(value, str) or len(value) < 12 or len(value) > 256:
-        raise ProtocolError()
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError:
-        raise ProtocolError() from None
-    if (
-        parsed.scheme != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-        or parsed.query
-        or parsed.fragment
-        or (parsed.hostname or "").lower() != parsed.hostname
-        or ((parsed.hostname or "").lower(), parsed.path) not in OFFICIAL_CODEX_URLS
-    ):
-        raise ProtocolError()
-    return value
-
-
-def sanitized_environment(provider: str, profile: Path) -> dict[str, str]:
-    allowed = {
-        "PATH": "/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/home/coder",
-        "USER": "coder",
-        "LOGNAME": "coder",
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "NO_COLOR": "1",
-        "DISABLE_AUTOUPDATER": "1",
-    }
-    if provider == "codex":
-        allowed["CODEX_HOME"] = str(profile)
-    elif provider == "claude":
-        allowed["CLAUDE_CONFIG_DIR"] = str(profile)
-    else:
-        raise HelperError("invalid_provider")
-    return allowed
-
-
-def _version_output(command: list[str]) -> str:
-    try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-            env=sanitized_environment("codex", Path("/nonexistent")),
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise HelperError("provider_protocol_incompatible") from None
-    if completed.returncode != 0 or len(completed.stdout) > 4096:
-        raise HelperError("provider_protocol_incompatible")
-    return completed.stdout.decode("utf-8", "replace").strip()
-
-
 def compatibility_manifest(check_commands: bool = True) -> dict[str, Any]:
-    if check_commands:
-        actual = {
-            "codex": _version_output(["codex", "--version"]),
-            "claude": _version_output(["claude", "--version"]),
-            "ttyd": _version_output([TTYD_PATH, "--version"]),
-        }
-        expected_patterns = {
-            "codex": re.compile(rf"(?:^|\s){re.escape(CODEX_VERSION)}(?:\s|$)"),
-            "claude": re.compile(rf"(?:^|\s){re.escape(CLAUDE_VERSION)}(?:\s|$)"),
-            # The pinned ttyd 1.7.7 binary identifies its exact release as
-            # `1.7.7-<commit>` rather than ending the version at 1.7.7.
-            "ttyd": re.compile(rf"(?:^|\s){re.escape(TTYD_VERSION)}(?:-|\s|$)"),
-        }
-        if any(not expected_patterns[name].search(output) for name, output in actual.items()):
-            raise HelperError("provider_protocol_incompatible")
+    # OAuth is implemented by this helper. The provider CLIs are consumers of
+    # the generated credentials and are deliberately not invoked here.
+    del check_commands
     return {
         "protocol": PROTOCOL_VERSION,
         "codex_version": CODEX_VERSION,
         "claude_version": CLAUDE_VERSION,
         "ttyd_version": TTYD_VERSION,
     }
-
-
-class JSONRPC:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        if process.stdin is None or process.stdout is None:
-            raise ProtocolError()
-        self.process = process
-        self.input: BinaryIO = process.stdin
-        self.output: BinaryIO = process.stdout
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.output, selectors.EVENT_READ)
-        self.next_id = 1
-        self.pending: list[dict[str, Any]] = []
-
-    def send(self, value: dict[str, Any]) -> None:
-        # The app-server JSONL transport carries JSON-RPC messages without the
-        # optional `jsonrpc` envelope member. Keep the wire format aligned with
-        # the documented stdio protocol while accepting either response form.
-        wire_value = dict(value)
-        wire_value.pop("jsonrpc", None)
-        encoded = (json.dumps(wire_value, separators=(",", ":")) + "\n").encode()
-        if len(encoded) > MAX_MESSAGE_BYTES:
-            raise ProtocolError()
-        try:
-            self.input.write(encoded)
-            self.input.flush()
-        except (BrokenPipeError, OSError):
-            raise ProtocolError() from None
-
-    def receive(self, deadline: float) -> dict[str, Any]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not self.selector.select(remaining):
-            raise HelperError("provider_timeout")
-        try:
-            line = self.output.readline(MAX_MESSAGE_BYTES + 1)
-        except OSError:
-            raise ProtocolError() from None
-        if not line or len(line) > MAX_MESSAGE_BYTES or not line.endswith(b"\n"):
-            raise ProtocolError()
-        try:
-            value = json.loads(line)
-        except (UnicodeError, json.JSONDecodeError):
-            raise ProtocolError() from None
-        # Codex app-server uses JSON-RPC 2.0 semantics over JSONL, but omits
-        # the protocol header on the wire. Accept the documented wire form;
-        # reject an explicitly supplied, invalid header.
-        if not isinstance(value, dict) or ("jsonrpc" in value and value.get("jsonrpc") != "2.0"):
-            raise ProtocolError()
-        return value
-
-    def request(self, method: str, params: Any, deadline: float) -> Any:
-        request_id = self.next_id
-        self.next_id += 1
-        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            message["params"] = params
-        self.send(message)
-        while True:
-            pending_index = next((index for index, item in enumerate(self.pending) if item.get("id") == request_id), None)
-            value = self.pending.pop(pending_index) if pending_index is not None else self.receive(deadline)
-            if value.get("id") != request_id:
-                self.pending.append(value)
-                if len(self.pending) > 256:
-                    raise ProtocolError()
-                continue
-            if "error" in value or "result" not in value:
-                raise ProtocolError()
-            return value["result"]
-
-    def notification(self, method: str) -> None:
-        self.send({"jsonrpc": "2.0", "method": method})
-
-    def wait_notification(self, method: str, deadline: float, cancelled: threading.Event) -> Any:
-        while True:
-            if cancelled.is_set():
-                raise HelperError("cancelled")
-            pending_index = next((index for index, item in enumerate(self.pending) if item.get("method") == method and "params" in item), None)
-            if pending_index is not None:
-                return self.pending.pop(pending_index)["params"]
-            short_deadline = min(deadline, time.monotonic() + 0.5)
-            try:
-                value = self.receive(short_deadline)
-            except HelperError as error:
-                if error.code == "provider_timeout" and time.monotonic() < deadline:
-                    continue
-                raise
-            if value.get("method") == method and "params" in value:
-                return value["params"]
-            self.pending.append(value)
-            if len(self.pending) > 256:
-                raise ProtocolError()
-
-    def close(self) -> None:
-        with contextlib.suppress(Exception):
-            self.selector.close()
-
-
-def start_codex(profile: Path) -> tuple[subprocess.Popen[bytes], JSONRPC]:
-    try:
-        process = subprocess.Popen(
-            ["codex", "app-server", "--listen", "stdio://"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=sanitized_environment("codex", profile),
-            start_new_session=True,
-        )
-    except OSError:
-        raise HelperError("provider_unavailable") from None
-    rpc = JSONRPC(process)
-    try:
-        initialized = rpc.request(
-            "initialize",
-            {
-                "clientInfo": {"name": "vibedock-auth-helper", "title": "VibeDock Auth Helper", "version": "1"},
-                "capabilities": {
-                    "experimentalApi": False,
-                    "requestAttestation": False,
-                    "optOutNotificationMethods": [],
-                    "mcpServerOpenaiFormElicitation": False,
-                },
-            },
-            time.monotonic() + 15,
-        )
-        if not isinstance(initialized, dict) or not isinstance(initialized.get("codexHome"), str):
-            raise ProtocolError()
-        if Path(initialized["codexHome"]) != profile:
-            raise ProtocolError()
-        rpc.notification("initialized")
-        return process, rpc
-    except Exception:
-        terminate_process(process)
-        rpc.close()
-        raise
-
-
-def terminate_process(process: subprocess.Popen[Any], grace: float = 2.0) -> None:
-    if process.poll() is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=1)
-
-
-def validate_account_result(value: Any) -> bool:
-    if not isinstance(value, dict) or not isinstance(value.get("requiresOpenaiAuth"), bool):
-        raise ProtocolError()
-    account = value.get("account")
-    if account is None:
-        return False
-    if not isinstance(account, dict) or account.get("type") not in {"chatgpt", "apiKey"}:
-        raise ProtocolError()
-    return True
-
-
-def codex_account(profile: Path) -> bool:
-    process, rpc = start_codex(profile)
-    try:
-        result = rpc.request("account/read", {"refreshToken": False}, time.monotonic() + 15)
-        return validate_account_result(result)
-    finally:
-        rpc.close()
-        terminate_process(process)
 
 
 def _write_marker(root: Path, marker: Path, phase: str, provider: str) -> None:
@@ -758,289 +550,352 @@ def _prepare_attempt(root: Path, item: dict[str, Path]) -> None:
                 os.unlink(temporary)
 
 
-def _signal_event() -> threading.Event:
-    event = threading.Event()
-
-    def handle_signal(_number: int, _frame: Any) -> None:
-        event.set()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-    return event
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
-def login_codex(root: Path, account: str, attempt: str, expiry: int) -> int:
-    item = paths(root, account, attempt, "codex")
-    _prepare_attempt(root, item)
-    state = base_state(account, attempt, "codex", expiry)
-    _atomic_json(root, item["state"], state)
-    cancelled = _signal_event()
-    process: subprocess.Popen[bytes] | None = None
-    rpc: JSONRPC | None = None
-    login_id = ""
-    try:
-        process, rpc = start_codex(item["stage"])
-        result = rpc.request("account/login/start", {"type": "chatgptDeviceCode"}, time.monotonic() + 30)
-        if not isinstance(result, dict) or set(("type", "loginId", "userCode", "verificationUrl")) - set(result):
-            raise ProtocolError()
-        if result.get("type") != "chatgptDeviceCode" or not isinstance(result.get("loginId"), str):
-            raise ProtocolError()
-        login_id = result["loginId"]
-        if not (1 <= len(login_id) <= 128):
-            raise ProtocolError()
-        code = result.get("userCode")
-        if not isinstance(code, str) or not USER_CODE_RE.fullmatch(code):
-            raise ProtocolError()
-        verification_url = validate_codex_url(result.get("verificationUrl"))
-        update_state(
-            root,
-            item["state"],
-            state,
-            "awaiting_user",
-            verification_url=verification_url,
-            user_code=code,
-            poll_after_ms=2000,
-        )
-        deadline = time.monotonic() + max(0, expiry - int(time.time()))
-        try:
-            completed = rpc.wait_notification("account/login/completed", deadline, cancelled)
-        except HelperError as error:
-            if error.code in {"cancelled", "provider_timeout"}:
-                with contextlib.suppress(HelperError):
-                    response = rpc.request("account/login/cancel", {"loginId": login_id}, time.monotonic() + 5)
-                    if not isinstance(response, dict) or response.get("status") not in {"canceled", "notFound"}:
-                        raise ProtocolError()
-                terminal = "cancelled" if cancelled.is_set() else "expired"
-                update_state(root, item["state"], state, terminal, error_code="")
-                return 0
-            raise
-        if (
-            not isinstance(completed, dict)
-            or completed.get("loginId") != login_id
-            or not isinstance(completed.get("success"), bool)
-        ):
-            raise ProtocolError()
-        if not completed["success"]:
-            raise HelperError("provider_login_failed")
-        update_state(root, item["state"], state, "verifying")
-        verified = rpc.request("account/read", {"refreshToken": False}, time.monotonic() + 15)
-        if not validate_account_result(verified):
-            raise HelperError("provider_verification_failed")
-        # Codex creates executable symlinks under its temporary argument
-        # directory while the app-server is running. Stop it before the
-        # profile safety check and discard those runtime-only artifacts.
-        rpc.close()
-        rpc = None
-        terminate_process(process)
-        process = None
-        for temporary in (item["stage"] / "tmp", item["stage"] / ".tmp"):
-            if temporary.exists() or temporary.is_symlink():
-                _remove_tree(root, temporary)
-        commit_staging(root, item, "codex")
-        update_state(root, item["state"], state, "completed", error_code="")
-        return 0
-    except HelperError as error:
-        status = "cancelled" if error.code == "cancelled" or cancelled.is_set() else "failed"
-        update_state(root, item["state"], state, status, error_code="" if status == "cancelled" else error.code)
-        return 0
-    except Exception:
-        update_state(root, item["state"], state, "failed", error_code="helper_internal_error")
-        return 0
-    finally:
-        if rpc is not None:
-            rpc.close()
-        if process is not None:
-            terminate_process(process)
-        if state.get("state") != "completed" and item["stage"].exists():
-            with contextlib.suppress(HelperError):
-                _remove_tree(root, item["stage"])
+def _pkce_values(provider: str) -> tuple[str, str, str]:
+    verifier_bytes = 64 if provider == "codex" else 32
+    verifier = _base64url(os.urandom(verifier_bytes))
+    challenge = _base64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    state = _base64url(os.urandom(32))
+    return state, verifier, challenge
 
 
-def validate_claude_status(value: Any) -> bool:
-    if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
-        raise ProtocolError()
-    if value["loggedIn"]:
-        if not isinstance(value.get("authMethod"), str) or not value["authMethod"]:
-            raise ProtocolError()
-        provider = value.get("apiProvider")
-        if provider is not None and not isinstance(provider, str):
-            raise ProtocolError()
-    return value["loggedIn"]
+def build_authorization_url(provider: str, state: str, challenge: str) -> str:
+    validate_provider(provider)
+    if provider == "codex":
+        values = {
+            "response_type": "code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "redirect_uri": CODEX_OAUTH_REDIRECT_URI,
+            "scope": CODEX_OAUTH_SCOPES,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": "codex_cli_rs",
+        }
+        return CODEX_OAUTH_AUTHORIZE_URL + "?" + urlencode(values)
+    values = {
+        "code": "true",
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": CLAUDE_OAUTH_REDIRECT_URI,
+        "scope": CLAUDE_OAUTH_SCOPES,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    return CLAUDE_OAUTH_AUTHORIZE_URL + "?" + urlencode(values)
 
 
-def claude_status(profile: Path) -> bool:
-    try:
-        completed = subprocess.run(
-            ["claude", "auth", "status", "--json"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
-            check=False,
-            env=sanitized_environment("claude", profile),
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise HelperError("provider_unavailable") from None
-    if len(completed.stdout) > MAX_STATE_BYTES:
+def validate_authorization_url(value: str, provider: str) -> str:
+    if not isinstance(value, str) or len(value) < 32 or len(value) > 4096:
         raise ProtocolError()
     try:
-        value = json.loads(completed.stdout)
-    except (UnicodeError, json.JSONDecodeError):
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
         raise ProtocolError() from None
-    # Claude may use a non-zero status when reporting loggedOut; the structured
-    # value, not the process status or terminal text, is authoritative.
-    return validate_claude_status(value)
+    expected_host, expected_path = AUTHORIZATION_URLS[provider]
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+        or (parsed.hostname or "").lower() != expected_host
+        or parsed.path != expected_path
+    ):
+        raise ProtocolError()
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    expected_client = CODEX_OAUTH_CLIENT_ID if provider == "codex" else CLAUDE_OAUTH_CLIENT_ID
+    expected_redirect = CODEX_OAUTH_REDIRECT_URI if provider == "codex" else CLAUDE_OAUTH_REDIRECT_URI
+    required = {
+        "client_id": expected_client,
+        "redirect_uri": expected_redirect,
+        "response_type": "code",
+        "code_challenge_method": "S256",
+    }
+    if any(query.get(name) != [expected] for name, expected in required.items()):
+        raise ProtocolError()
+    if len(query.get("state", [])) != 1 or len(query.get("code_challenge", [])) != 1:
+        raise ProtocolError()
+    return value
 
 
-def claude_login_child(root: Path, account: str, attempt: str, expiry: int) -> int:
-    item = paths(root, account, attempt, "claude")
-    state = _read_json(root, item["state"])
+def install_staged_credentials(root: Path, item: dict[str, Path], provider: str) -> None:
+    """Atomically replace only the provider credential, preserving profile data."""
+    name = "auth.json" if provider == "codex" else ".credentials.json"
+    source = item["stage"] / name
+    _assert_tree_safe(root, item["stage"])
+    if item["stable"].exists() or item["stable"].is_symlink():
+        _assert_directory_entry(root, item["stable"])
+    else:
+        _mkdir_secure(root, item["stable"])
+    target = item["stable"] / name
+    _assert_components(root, target)
+    os.replace(source, target)
+    directory = os.open(item["stable"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        descriptor = os.open(item["claim"], os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        os.close(descriptor)
-    except FileExistsError:
-        print("This login terminal is already active.")
-        return 1
-    try:
-        if int(time.time()) >= expiry or item["cancel"].exists():
-            return 1
-        completed = subprocess.run(
-            ["claude", "auth", "login", "--claudeai"],
-            stdin=None,
-            stdout=None,
-            stderr=None,
-            timeout=max(1, expiry - int(time.time())),
-            check=False,
-            env=sanitized_environment("claude", item["stage"]),
-        )
-        if completed.returncode != 0 or item["cancel"].exists():
-            raise HelperError("provider_login_failed")
-        update_state(root, item["state"], state, "verifying")
-        if not claude_status(item["stage"]):
-            raise HelperError("provider_verification_failed")
-        if item["cancel"].exists():
-            raise HelperError("cancelled")
-        commit_staging(root, item, "claude")
-        update_state(root, item["state"], state, "completed", error_code="")
-        print("Official Claude Code login verified. You may close this terminal.")
-        return 0
-    except subprocess.TimeoutExpired:
-        update_state(root, item["state"], state, "expired", error_code="")
-        return 1
-    except HelperError as error:
-        status = "cancelled" if error.code == "cancelled" else "failed"
-        update_state(root, item["state"], state, status, error_code="" if status == "cancelled" else error.code)
-        print("Claude Code login was not verified. You may close this terminal.")
-        return 1
-    except Exception:
-        update_state(root, item["state"], state, "failed", error_code="helper_internal_error")
-        return 1
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    _remove_tree(root, item["stage"])
 
 
-def terminal_secret() -> int:
-    value = sys.stdin.buffer.readline(256)
-    if len(value) > 129:
-        raise HelperError("invalid_terminal_credential")
-    password = value.decode("ascii", errors="strict").strip()
-    if not (32 <= len(password) <= 128) or not re.fullmatch(r"[A-Za-z0-9_-]+", password):
-        raise HelperError("invalid_terminal_credential")
-    path = Path("/tmp/vibedock-auth-terminal-password")
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="ascii", closefd=True) as output:
-            output.write(password + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        raise
-    return 0
-
-
-def login_claude(root: Path, account: str, attempt: str, expiry: int) -> int:
-    item = paths(root, account, attempt, "claude")
+def start_oauth(root: Path, account: str, attempt: str, provider: str, expiry: int) -> dict[str, Any]:
+    item = paths(root, account, attempt, provider)
     _prepare_attempt(root, item)
-    state = base_state(account, attempt, "claude", expiry)
-    update_state(root, item["state"], state, "starting", terminal_available=False)
-    secret_path = Path("/tmp/vibedock-auth-terminal-password")
-    deadline = min(expiry, int(time.time()) + 30)
-    while not secret_path.exists() and int(time.time()) < deadline:
-        time.sleep(0.05)
+    state_value = base_state(account, attempt, provider, expiry)
+    state, verifier, challenge = _pkce_values(provider)
+    authorization_url = build_authorization_url(provider, state, challenge)
+    validate_authorization_url(authorization_url, provider)
+    redirect_uri = CODEX_OAUTH_REDIRECT_URI if provider == "codex" else CLAUDE_OAUTH_REDIRECT_URI
+    _atomic_json(root, item["oauth"], {
+        "version": 1,
+        "provider": provider,
+        "state": state,
+        "code_verifier": verifier,
+        "redirect_uri": redirect_uri,
+        "expires_at": expiry,
+    })
+    update_state(
+        root,
+        item["state"],
+        state_value,
+        "awaiting_user",
+        verification_url=authorization_url,
+        user_code="",
+        poll_after_ms=2000,
+    )
+    return state_value
+
+
+def _valid_oauth_value(value: Any, name: str, required: bool = True) -> str:
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str) or len(value) < 8 or len(value) > 65536 or any(ord(character) < 0x20 for character in value):
+        raise HelperError("provider_token_invalid", name)
+    return value
+
+
+def parse_authorization_response(provider: str, response: str, expected_state: str) -> str:
+    value = response.strip()
+    if not value or len(value.encode("utf-8")) > MAX_AUTH_RESPONSE_BYTES or "\x00" in value:
+        raise HelperError("authorization_response_invalid")
+    code = ""
+    returned_state = ""
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError:
+            raise HelperError("authorization_response_invalid") from None
+        if provider == "codex":
+            valid_redirect = (
+                parsed.scheme == "http"
+                and parsed.hostname == "localhost"
+                and port == 1455
+                and parsed.path == "/auth/callback"
+            )
+        else:
+            valid_redirect = (
+                parsed.scheme == "https"
+                and parsed.hostname == "platform.claude.com"
+                and port in (None, 443)
+                and parsed.path == "/oauth/code/callback"
+            )
+        if (
+            not valid_redirect
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or any(len(values) != 1 for values in parse_qs(parsed.query, keep_blank_values=True).values())
+        ):
+            raise HelperError("authorization_response_invalid")
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if query.get("error"):
+            raise HelperError("provider_authorization_rejected")
+        code = query.get("code", [""])[0]
+        returned_state = query.get("state", [""])[0]
+    elif provider == "claude" and value.count("#") == 1:
+        code, returned_state = value.split("#", 1)
+    else:
+        raise HelperError("authorization_response_invalid")
+    code = _valid_oauth_value(code, "code")
+    returned_state = _valid_oauth_value(returned_state, "state")
+    if not hmac.compare_digest(returned_state, expected_state):
+        raise HelperError("authorization_state_mismatch")
+    return code
+
+
+def _request_token(provider: str, code: str, verifier: str, redirect_uri: str, state: str) -> dict[str, Any]:
+    if provider == "codex":
+        body = urlencode({
+            "grant_type": "authorization_code",
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }).encode("ascii")
+        request = Request(CODEX_OAUTH_TOKEN_URL, data=body, headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "codex-cli/" + CODEX_VERSION,
+        }, method="POST")
+    else:
+        body = json.dumps({
+            "grant_type": "authorization_code",
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+            "state": state,
+        }, separators=(",", ":")).encode("utf-8")
+        request = Request(CLAUDE_OAUTH_TOKEN_URL, data=body, headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/" + CLAUDE_VERSION,
+        }, method="POST")
     try:
-        info = os.lstat(secret_path)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 129:
-            raise HelperError("invalid_terminal_credential")
-        password = secret_path.read_text(encoding="ascii").strip()
-    except (OSError, UnicodeError, HelperError):
-        update_state(root, item["state"], state, "failed", error_code="invalid_terminal_credential")
-        return 0
-    finally:
+        with TOKEN_OPENER.open(request, timeout=60) as response:
+            encoded = response.read(MAX_STATE_BYTES + 1)
+    except HTTPError as error:
+        error.close()
+        raise HelperError("provider_exchange_rejected") from None
+    except (URLError, TimeoutError, OSError):
+        raise HelperError("provider_unavailable") from None
+    if len(encoded) > MAX_STATE_BYTES:
+        raise HelperError("provider_response_too_large")
+    try:
+        value = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise HelperError("provider_response_invalid") from None
+    if not isinstance(value, dict):
+        raise HelperError("provider_response_invalid")
+    return value
+
+
+def _jwt_claims(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        value = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _codex_account_id(id_token: str, access_token: str) -> str | None:
+    claim_name = "https://api.openai.com/auth"
+    for token in (id_token, access_token):
+        claims = _jwt_claims(token)
+        auth = claims.get(claim_name)
+        if isinstance(auth, dict):
+            account_id = auth.get("chatgpt_account_id")
+            if isinstance(account_id, str) and 1 <= len(account_id) <= 256:
+                return account_id
+    return None
+
+
+def _write_provider_credentials(root: Path, item: dict[str, Path], provider: str, token: dict[str, Any]) -> None:
+    access_token = _valid_oauth_value(token.get("access_token"), "access_token")
+    refresh_token = _valid_oauth_value(token.get("refresh_token"), "refresh_token")
+    if provider == "codex":
+        id_token = _valid_oauth_value(token.get("id_token"), "id_token")
+        credentials = {
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "account_id": _codex_account_id(id_token, access_token),
+            },
+            "last_refresh": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        _atomic_json(root, item["stage"] / "auth.json", credentials)
+        return
+    expires_in = token.get("expires_in")
+    if not isinstance(expires_in, (int, float)) or isinstance(expires_in, bool) or expires_in <= 0 or expires_in > 366 * 24 * 3600:
+        raise HelperError("provider_token_invalid")
+    raw_scopes = token.get("scope")
+    if isinstance(raw_scopes, str):
+        scopes = [scope for scope in raw_scopes.split() if scope]
+    elif isinstance(raw_scopes, list) and all(isinstance(scope, str) and scope for scope in raw_scopes):
+        scopes = raw_scopes
+    else:
+        scopes = CLAUDE_OAUTH_SCOPES.split()
+    if not scopes:
+        raise HelperError("provider_token_invalid")
+    if "user:inference" not in scopes:
+        raise HelperError("provider_token_invalid")
+    credentials = {"claudeAiOauth": {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": int(time.time() * 1000 + float(expires_in) * 1000),
+        "scopes": scopes,
+    }}
+    _atomic_json(root, item["stage"] / ".credentials.json", credentials)
+
+
+def complete_oauth(root: Path, account: str, attempt: str, provider: str, response: str) -> dict[str, Any]:
+    item = paths(root, account, attempt, provider)
+    state_value = inspect_attempt(root, account, attempt, provider)
+    if state_value["state"] in TERMINAL_STATES:
+        return state_value
+    if int(time.time()) >= state_value["expires_at"]:
+        update_state(root, item["state"], state_value, "expired", error_code="")
+        return state_value
+    try:
+        oauth = _read_json(root, item["oauth"])
+        if (
+            oauth.get("version") != 1
+            or oauth.get("provider") != provider
+            or oauth.get("expires_at") != state_value["expires_at"]
+            or not isinstance(oauth.get("state"), str)
+            or not isinstance(oauth.get("code_verifier"), str)
+            or not isinstance(oauth.get("redirect_uri"), str)
+        ):
+            raise HelperError("oauth_session_invalid")
+        code = parse_authorization_response(provider, response, oauth["state"])
+        oauth["verification_deadline"] = int(time.time()) + VERIFYING_TTL_SECONDS
+        _atomic_json(root, item["oauth"], oauth)
+        update_state(root, item["state"], state_value, "verifying")
+        token = _request_token(provider, code, oauth["code_verifier"], oauth["redirect_uri"], oauth["state"])
+        _write_provider_credentials(root, item, provider, token)
+        install_staged_credentials(root, item, provider)
+        update_state(root, item["state"], state_value, "completed", error_code="")
         with contextlib.suppress(FileNotFoundError):
-            secret_path.unlink()
-    if not (32 <= len(password) <= 128) or not re.fullmatch(r"[A-Za-z0-9_-]+", password):
-        update_state(root, item["state"], state, "failed", error_code="invalid_terminal_credential")
-        return 0
-    update_state(root, item["state"], state, "awaiting_user", terminal_available=True)
-    command = [
-        TTYD_PATH,
-        "-p", str(TTYD_PORT),
-        "-W",
-        "-o",
-        "-c", "vibe:" + password,
-        "-t", "titleFixed=VibeDock Claude Login",
-        HELPER_PATH,
-        "claude-login-child",
-        "--account", account,
-        "--attempt", attempt,
-        "--expires-at", str(expiry),
-    ]
-    cancelled = _signal_event()
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=sanitized_environment("claude", item["stage"]),
-            start_new_session=True,
-        )
-    except OSError:
-        update_state(root, item["state"], state, "failed", error_code="provider_unavailable")
-        return 0
-    try:
-        while True:
-            try:
-                current = _read_json(root, item["state"])
-                state = current
-            except HelperError:
-                update_state(root, item["state"], state, "failed", error_code="invalid_state")
-                return 0
-            if state.get("state") in TERMINAL_STATES:
-                return 0
-            if cancelled.is_set():
-                item["cancel"].touch(mode=0o600, exist_ok=True)
-                terminate_process(process)
-                update_state(root, item["state"], state, "cancelled", error_code="")
-                return 0
-            if int(time.time()) >= expiry:
-                item["cancel"].touch(mode=0o600, exist_ok=True)
-                terminate_process(process)
-                update_state(root, item["state"], state, "expired", error_code="")
-                return 0
-            if process.poll() is not None:
-                # A successful child writes a terminal state before ttyd exits.
-                time.sleep(0.1)
-                state = _read_json(root, item["state"])
-                if state.get("state") not in TERMINAL_STATES:
-                    update_state(root, item["state"], state, "failed", error_code="provider_login_failed")
-                return 0
-            time.sleep(0.25)
-    finally:
-        terminate_process(process)
-        if state.get("state") != "completed" and item["stage"].exists():
+            os.unlink(item["oauth"])
+    except HelperError as error:
+        update_state(root, item["state"], state_value, "failed", error_code=error.code)
+        if item["stage"].exists() or item["stage"].is_symlink():
             with contextlib.suppress(HelperError):
                 _remove_tree(root, item["stage"])
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(item["oauth"])
+    return state_value
+
+
+def cancel_oauth(root: Path, account: str, attempt: str, provider: str) -> dict[str, Any]:
+    item = paths(root, account, attempt, provider)
+    state_value = inspect_attempt(root, account, attempt, provider)
+    if state_value["state"] == "completed":
+        return state_value
+    if state_value["state"] not in TERMINAL_STATES:
+        update_state(root, item["state"], state_value, "cancelled", error_code="")
+    for path in (item["oauth"], item["cancel"], item["claim"]):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+    if item["stage"].exists() or item["stage"].is_symlink():
+        _remove_tree(root, item["stage"])
+    return state_value
 
 
 def inspect_attempt(root: Path, account: str, attempt: str, provider: str) -> dict[str, Any]:
@@ -1072,15 +927,102 @@ def inspect_attempt(root: Path, account: str, attempt: str, provider: str) -> di
         or value["poll_after_ms"] > 30000
     ):
         raise HelperError("invalid_state")
-    if value["state"] == "awaiting_user" and provider == "codex":
-        validate_codex_url(value["verification_url"])
-        if not USER_CODE_RE.fullmatch(value["user_code"]):
+    if value["state"] == "awaiting_user":
+        validate_authorization_url(value["verification_url"], provider)
+        if value["user_code"] or value["terminal_available"]:
             raise HelperError("invalid_state")
-    if value["state"] in TERMINAL_STATES and (
+        if int(time.time()) >= value["expires_at"]:
+            update_state(root, item["state"], value, "expired", error_code="")
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(item["oauth"])
+            if item["stage"].exists() or item["stage"].is_symlink():
+                _remove_tree(root, item["stage"])
+    elif value["state"] == "verifying":
+        try:
+            oauth = _read_json(root, item["oauth"])
+            verification_deadline = oauth.get("verification_deadline")
+            if not isinstance(verification_deadline, int):
+                raise HelperError("oauth_session_invalid")
+        except HelperError as error:
+            update_state(root, item["state"], value, "failed", error_code=error.code)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(item["oauth"])
+            if item["stage"].exists() or item["stage"].is_symlink():
+                _remove_tree(root, item["stage"])
+        else:
+            if int(time.time()) >= verification_deadline:
+                update_state(root, item["state"], value, "expired", error_code="")
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(item["oauth"])
+                if item["stage"].exists() or item["stage"].is_symlink():
+                    _remove_tree(root, item["stage"])
+    elif (
         value["verification_url"] or value["user_code"] or value["terminal_available"]
     ):
         raise HelperError("invalid_state")
     return value
+
+
+def _read_provider_credentials(root: Path, path: Path) -> dict[str, Any]:
+    _assert_components(root, path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise HelperError("credentials_missing") from None
+    except OSError:
+        raise HelperError("credentials_invalid") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > MAX_STATE_BYTES:
+            raise HelperError("credentials_invalid")
+        chunks = []
+        remaining = MAX_STATE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(encoded) > MAX_STATE_BYTES:
+        raise HelperError("credentials_invalid")
+    try:
+        value = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise HelperError("credentials_invalid") from None
+    if not isinstance(value, dict):
+        raise HelperError("credentials_invalid")
+    return value
+
+
+def _credentials_are_valid(provider: str, value: dict[str, Any]) -> bool:
+    if provider == "codex":
+        tokens = value.get("tokens")
+        if value.get("auth_mode") != "chatgpt" or not isinstance(tokens, dict):
+            return False
+        required_tokens_valid = all(
+            isinstance(tokens.get(name), str) and 1 <= len(tokens[name]) <= (128 << 10)
+            for name in ("id_token", "access_token", "refresh_token")
+        )
+        account_id = tokens.get("account_id")
+        return required_tokens_valid and (
+            account_id is None
+            or (isinstance(account_id, str) and 1 <= len(account_id) <= 256)
+        )
+    oauth = value.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    scopes = oauth.get("scopes")
+    return (
+        all(isinstance(oauth.get(name), str) and 1 <= len(oauth[name]) <= (128 << 10) for name in ("accessToken", "refreshToken"))
+        and isinstance(oauth.get("expiresAt"), (int, float))
+        and not isinstance(oauth.get("expiresAt"), bool)
+        and isinstance(scopes, list)
+        and bool(scopes)
+        and all(isinstance(scope, str) and bool(scope) for scope in scopes)
+    )
 
 
 def provider_status(root: Path, account: str, provider: str) -> dict[str, Any]:
@@ -1091,17 +1033,19 @@ def provider_status(root: Path, account: str, provider: str) -> dict[str, Any]:
     _assert_components(root, stable, allow_leaf_symlink=True)
     checked_at = int(time.time())
     if not stable.exists() or stable.is_symlink():
-        return {"protocol": PROTOCOL_VERSION, "status": "unauthenticated", "checked_at": checked_at, "message": "No local official CLI credentials"}
-    _assert_tree_safe(root, stable)
+        return {"protocol": PROTOCOL_VERSION, "status": "unauthenticated", "checked_at": checked_at, "message": "No managed credentials"}
+    credential_path = stable / ("auth.json" if provider == "codex" else ".credentials.json")
     try:
-        authenticated = codex_account(stable) if provider == "codex" else claude_status(stable)
-    except HelperError:
-        return {"protocol": PROTOCOL_VERSION, "status": "unavailable", "checked_at": checked_at, "message": "Official CLI status unavailable"}
+        authenticated = _credentials_are_valid(provider, _read_provider_credentials(root, credential_path))
+    except HelperError as error:
+        if error.code == "credentials_missing":
+            return {"protocol": PROTOCOL_VERSION, "status": "unauthenticated", "checked_at": checked_at, "message": "No managed credentials"}
+        return {"protocol": PROTOCOL_VERSION, "status": "unavailable", "checked_at": checked_at, "message": "Managed credentials are unavailable"}
     return {
         "protocol": PROTOCOL_VERSION,
         "status": "authenticated" if authenticated else "unauthenticated",
         "checked_at": checked_at,
-        "message": "Official CLI status checked",
+        "message": "Managed credentials checked",
     }
 
 
@@ -1111,40 +1055,27 @@ def provider_logout(root: Path, account: str, provider: str) -> dict[str, Any]:
     root = _ensure_root(root)
     stable = root / account / provider
     _assert_components(root, stable, allow_leaf_symlink=True)
-    confirmed = False
+    removed = False
     if stable.exists() and not stable.is_symlink():
+        _assert_directory_entry(root, stable)
+        credential_path = stable / ("auth.json" if provider == "codex" else ".credentials.json")
+        _assert_components(root, credential_path, allow_leaf_symlink=True)
         try:
-            if provider == "codex":
-                process, rpc = start_codex(stable)
-                try:
-                    response = rpc.request("account/logout", None, time.monotonic() + 30)
-                    confirmed = isinstance(response, dict)
-                finally:
-                    rpc.close()
-                    terminate_process(process)
-            else:
-                completed = subprocess.run(
-                    ["claude", "auth", "logout"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=30,
-                    check=False,
-                    env=sanitized_environment("claude", stable),
-                )
-                confirmed = completed.returncode == 0
-        except (HelperError, OSError, subprocess.SubprocessError):
-            confirmed = False
-    removed = _remove_tree(root, stable)
-    account_path = root / account
-    _assert_components(root, account_path)
-    with contextlib.suppress(OSError):
-        account_path.rmdir()
+            info = os.lstat(credential_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISDIR(info.st_mode):
+                raise HelperError("credentials_invalid")
+            os.unlink(credential_path)
+            removed = True
+    elif stable.is_symlink():
+        raise HelperError("unsafe_credentials_path")
     return {
         "protocol": PROTOCOL_VERSION,
-        "local_credentials_removed": removed or not stable.exists(),
-        "provider_logout_confirmed": confirmed,
-        "message": "Local credentials removed" if confirmed else "Local credentials removed; provider logout unconfirmed",
+        "local_credentials_removed": removed or not (stable / ("auth.json" if provider == "codex" else ".credentials.json")).exists(),
+        "provider_logout_confirmed": False,
+        "message": "Local credentials removed; provider token revocation was not requested",
     }
 
 
@@ -1186,7 +1117,7 @@ def prepare_cleanup(root: Path, account: str, cleanup: str, now: int) -> dict[st
         moved = False
         try:
             if item["stable"].exists() or item["stable"].is_symlink():
-                _assert_tree_safe(root, item["stable"])
+                _assert_directory_entry(root, item["stable"])
                 os.replace(item["stable"], item["quarantine"])
                 moved = True
             _cleanup_marker(root, item, account, cleanup, "prepared", now)
@@ -1217,7 +1148,7 @@ def finish_cleanup(root: Path, account: str, cleanup: str, action: str) -> dict[
                 _remove_tree(root, item["quarantine"])
         else:
             if item["quarantine"].exists() or item["quarantine"].is_symlink():
-                _assert_tree_safe(root, item["quarantine"])
+                _assert_directory_entry(root, item["quarantine"])
                 if item["stable"].exists() or item["stable"].is_symlink():
                     raise HelperError("cleanup_restore_conflict")
                 os.replace(item["quarantine"], item["stable"])
@@ -1254,7 +1185,7 @@ def _reconcile_cleanups(root: Path, now: int) -> int:
                 # Prepare transactions are rolled back on startup. This never
                 # silently commits a Store mutation whose result is unknown.
                 if item["quarantine"].exists():
-                    _assert_tree_safe(root, item["quarantine"])
+                    _assert_directory_entry(root, item["quarantine"])
                     if item["stable"].exists() or item["stable"].is_symlink():
                         # Preserve both trees for explicit operator recovery.
                         continue
@@ -1297,13 +1228,14 @@ def reconcile(root: Path, now: int) -> dict[str, Any]:
                 item = paths(root, account_path.name, attempt_path.name, provider)
                 with attempt_lock(root, item["lock"]):
                     recover_commit(root, item, provider)
-                expires_at = state.get("expires_at")
+                state = inspect_attempt(root, account_path.name, attempt_path.name, provider)
                 terminal = state.get("state") in TERMINAL_STATES
-                stale = isinstance(expires_at, int) and expires_at <= now
+                state_mtime = int(os.lstat(state_path).st_mtime)
+                stale = terminal and state_mtime + TERMINAL_RETENTION_SECONDS <= now
             except HelperError:
                 # Unknown trees are never recursively deleted by reconciliation.
                 continue
-            if terminal or stale:
+            if stale:
                 _remove_tree(root, attempt_path)
                 removed += 1
         with contextlib.suppress(OSError):
@@ -1318,18 +1250,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     subparsers = parser.add_subparsers(dest="operation", required=True)
     subparsers.add_parser("protocol", add_help=False)
-    subparsers.add_parser("terminal-secret", add_help=False)
-    for operation in ("login", "inspect"):
+    for operation in ("login", "complete", "cancel", "inspect"):
         child = subparsers.add_parser(operation, add_help=False, allow_abbrev=False)
         child.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
         child.add_argument("--account", required=True)
         child.add_argument("--attempt", required=True)
         if operation == "login":
             child.add_argument("--expires-at", required=True, type=int)
-    child = subparsers.add_parser("claude-login-child", add_help=False, allow_abbrev=False)
-    child.add_argument("--account", required=True)
-    child.add_argument("--attempt", required=True)
-    child.add_argument("--expires-at", required=True, type=int)
     for operation in ("status", "logout"):
         child = subparsers.add_parser(operation, add_help=False, allow_abbrev=False)
         child.add_argument("--provider", required=True, choices=sorted(PROVIDERS))
@@ -1358,29 +1285,28 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         root = CREDENTIALS_ROOT
         if args.operation == "protocol":
-            result = compatibility_manifest(True)
-        elif args.operation == "terminal-secret":
-            return terminal_secret()
+            result = compatibility_manifest(False)
         elif args.operation == "login":
-            compatibility_manifest(True)
             account = validate_account(args.account)
             attempt = validate_attempt(args.attempt)
             expiry = validate_expiry(args.expires_at)
-            if args.provider == "codex":
-                return login_codex(root, account, attempt, expiry)
-            return login_claude(root, account, attempt, expiry)
-        elif args.operation == "claude-login-child":
-            account = validate_account(args.account)
-            attempt = validate_attempt(args.attempt)
-            expiry = validate_expiry(args.expires_at)
-            return claude_login_child(root, account, attempt, expiry)
+            result = start_oauth(root, account, attempt, args.provider, expiry)
+        elif args.operation == "complete":
+            encoded = sys.stdin.buffer.read(MAX_AUTH_RESPONSE_BYTES + 1)
+            if len(encoded) > MAX_AUTH_RESPONSE_BYTES:
+                raise HelperError("authorization_response_invalid")
+            try:
+                response = encoded.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HelperError("authorization_response_invalid") from None
+            result = complete_oauth(root, args.account, args.attempt, args.provider, response)
+        elif args.operation == "cancel":
+            result = cancel_oauth(root, args.account, args.attempt, args.provider)
         elif args.operation == "inspect":
             result = inspect_attempt(root, args.account, args.attempt, args.provider)
         elif args.operation == "status":
-            compatibility_manifest(True)
             result = provider_status(root, args.account, args.provider)
         elif args.operation == "logout":
-            compatibility_manifest(True)
             result = provider_logout(root, args.account, args.provider)
         elif args.operation == "config-list":
             result = list_config(root, args.account, args.provider)

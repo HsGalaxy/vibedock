@@ -222,15 +222,15 @@ VibeDock 根据协议生成 Provider adapter 配置，并通过 OpenCode 的环�
 
 ## Codex 与 Claude Code 账号中心
 
-### Codex：使用 ChatGPT 官方设备登录
+### Codex：使用 ChatGPT 官方网页登录
 
 1. 打开“账号与 Provider”；
 2. 点击“使用 ChatGPT 登录 Codex”；
 3. 已有原生登录档案会直接开始；没有时先创建一个 `网页登录 / 官方 CLI` 档案；
-4. 在弹窗中复制设备代码并打开服务端验证过的 OpenAI 官方 HTTPS 页面；
-5. 完成后等待 Codex 官方 app-server 确认账号状态。
+4. 打开服务端生成并验证过的 OpenAI 官方授权页面；
+5. 授权后浏览器会跳到不可访问的 localhost 地址，把地址栏中的完整回调 URL 粘贴回 VibeDock 完成登录。
 
-VibeDock 使用 Codex 0.144.6 的结构化设备授权协议。它不会索取 ChatGPT 密码，也不会把设备代码拼进 URL。普通 localhost OAuth 回调不适用于远程 Workspace，因此不作为后备方案。
+VibeDock 对齐 Codex 0.144.6 的官方 PKCE 合约，在一次性 helper 中校验 state、兑换授权码，并原子生成 Codex 标准 `auth.json`。VibeDock 不接收 ChatGPT 密码；localhost 只作为 OpenAI 注册的回调标识，VibeDock 不会监听用户设备的 1455 端口。
 
 登录状态保存在：
 
@@ -253,7 +253,7 @@ VibeDock 会为该账号生成独立 `CODEX_HOME/config.toml`。当前自定义 
 
 ### Claude Code：使用 Claude.ai 官方登录
 
-在“账号与 Provider”点击“使用 Claude.ai 登录 Claude”。VibeDock 会打开一个与普通 Agent Session 分离的受保护登录终端，其中运行官方 `claude auth login --claudeai`。用户按官方 CLI 提示打开 Anthropic 页面，再把 `authorizationCode#state` 授权响应粘贴回官方 CLI；VibeDock 不实现 Anthropic 回调，不解析授权响应，也不接收 Claude.ai 密码。完成状态由 `claude auth status --json` 验证。
+在“账号与 Provider”点击“使用 Claude.ai 登录 Claude”，打开 Anthropic 官方授权页面，再把页面返回的 `authorizationCode#state` 粘贴回 VibeDock。helper 会严格比对 state、兑换授权码，并原子生成 Claude Code 标准 `.credentials.json`。VibeDock 不接收 Claude.ai 密码。
 
 状态保存在：
 
@@ -277,12 +277,13 @@ Codex/Claude Session 不选择托管账号时，沿用 Workspace Home 中已有�
 
 ### 登录入口与边界
 
-- Codex：在“账号与 Provider”点击“使用 ChatGPT 登录 Codex”，通过官方设备页面登录；不需要先创建或找到普通 Agent Session；
-- Claude：在同一页面点击“使用 Claude.ai 登录 Claude”，使用专用官方 CLI 登录终端；不需要运行 Workspace；
-- 登录助手是短时固定命令容器，只挂载共享凭据卷；验证码、完整登录 URL、ttyd 内部密码和授权响应不写入状态文件、日志或浏览器存储；
-- 登录先写入 staging 档案，只有官方 CLI 验证成功才替换稳定档案；失败、取消或过期的重新登录不会破坏已有有效档案；
+- Codex：在“账号与 Provider”点击“使用 ChatGPT 登录 Codex”，通过 OpenAI 官方授权页面登录；不需要先创建或找到普通 Agent Session；
+- Claude：在同一页面点击“使用 Claude.ai 登录 Claude”，通过 Anthropic 官方授权页面登录；不需要运行 Workspace；
+- 登录助手是一次性固定命令容器，只挂载共享凭据卷；PKCE verifier、授权码、Provider token 和凭据内容不会写入控制面日志或浏览器存储；
+- 登录先写入 staging 档案，只有 state 校验和官方 token 兑换都成功后才原子替换认证文件；用户编辑的配置、Codex 数据库和 CLI 运行状态会保留，失败、取消或过期的重新登录不会破坏已有有效档案；
 - 关闭登录弹窗不会取消尝试；可以从账号卡片继续。取消、重试、重新登录和退出登录都有独立操作；
-- Claude setup-token：先使用 Claude 官方 CLI 生成已有 Token，再保存到 VibeDock；这是 Token 导入，不是 Claude.ai 网页登录；VibeDock 不发起、不代理也不模拟第三方 OAuth；
+- 退出登录只删除 VibeDock 管理的本地认证文件，保留用户编辑配置和 CLI 运行状态；它不保证撤销 Provider 侧已签发的 token，需要远程撤销时应在对应账号的安全设置中操作；
+- Claude setup-token：先使用 Claude 官方 CLI 生成已有 Token，再保存到 VibeDock；这是 Token 导入，与上述 Claude.ai PKCE 网页登录相互独立；
 - Pi / OpenCode：没有统一账号对象，必须在 Session 中显式填写 Provider ID、Base URL、模型、协议和 API Key / Token；不完整配置会被 API 拒绝，避免创建看似运行但实际不可用的 Session；
 - Session 启动失败时，API 会保留 `status: error` 和错误信息，前端明确显示“已保存但未就绪”，不会提示普通成功。
 
@@ -492,6 +493,7 @@ POST   /api/accounts/{account}/probe
 GET    /api/accounts/{account}/auth-status
 POST   /api/accounts/{account}/login-attempts
 GET    /api/accounts/{account}/login-attempts/{attempt}
+POST   /api/accounts/{account}/login-attempts/{attempt}/complete
 DELETE /api/accounts/{account}/login-attempts/{attempt}
 POST   /api/accounts/{account}/logout
 DELETE /api/accounts/{account}

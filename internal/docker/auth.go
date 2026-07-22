@@ -5,19 +5,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"vibedock/internal/model"
@@ -28,16 +25,21 @@ const (
 	authHelperEntrypoint   = "/usr/local/bin/vibedock-auth-helper"
 	authHelperProtocol     = 1
 	authCredentialsVolume  = "vibedock-credentials"
-	authTerminalPort       = 7681
 	authOutputLimit        = 1 << 20
+	authResponseLimit      = 8 << 10
+	codexOAuthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexOAuthRedirectURI  = "http://localhost:1455/auth/callback"
+	codexOAuthScopes       = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+	claudeOAuthClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	claudeOAuthRedirectURI = "https://platform.claude.com/oauth/code/callback"
+	claudeOAuthScopes      = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
 var (
-	authAccountPattern  = regexp.MustCompile(`^[a-z0-9]{12}$`)
-	authAttemptPattern  = regexp.MustCompile(`^[a-z0-9]{24}$`)
-	authCleanupPattern  = regexp.MustCompile(`^[a-z0-9]{32}$`)
-	authUserCodePattern = regexp.MustCompile(`^[A-Z0-9-]{4,32}$`)
-	authTerminalSecrets sync.Map
+	authAccountPattern = regexp.MustCompile(`^[a-z0-9]{12}$`)
+	authAttemptPattern = regexp.MustCompile(`^[a-z0-9]{24}$`)
+	authCleanupPattern = regexp.MustCompile(`^[a-z0-9]{32}$`)
+	authOAuthPattern   = regexp.MustCompile(`^[A-Za-z0-9._~-]{20,256}$`)
 )
 
 type authHelperState struct {
@@ -153,22 +155,6 @@ func validateAuthAccount(accountID string) error {
 	return nil
 }
 
-func authContainerName(ref model.AuthAttemptRef) string {
-	return "vibedock-auth-" + ref.AttemptID
-}
-
-func authSecretKey(ref model.AuthAttemptRef) string {
-	return ref.AccountID + "/" + ref.AttemptID + "/" + string(ref.Provider)
-}
-
-func authTerminalPassword() (string, error) {
-	value := make([]byte, 32)
-	if _, err := rand.Read(value); err != nil {
-		return "", errors.New("generate authentication terminal credential")
-	}
-	return base64.RawURLEncoding.EncodeToString(value), nil
-}
-
 func authCleanupID() (string, error) {
 	value := make([]byte, 20)
 	if _, err := rand.Read(value); err != nil {
@@ -208,10 +194,43 @@ func (r *Runtime) authPrerequisites(ctx context.Context, network bool) error {
 			return errors.New("authentication helper network unavailable")
 		}
 	}
-	if _, err := r.authRun(ctx, "create credentials volume", "volume", "create", authCredentialsVolume); err != nil {
+	if err := r.authEnsureStorage(ctx); err != nil {
 		return err
 	}
 	return r.authProtocol(ctx)
+}
+
+func (r *Runtime) authEnsureStorage(ctx context.Context) error {
+	if _, err := r.authRun(ctx, "create credentials volume", "volume", "create", authCredentialsVolume); err != nil {
+		return err
+	}
+	if _, err := r.authRun(ctx, "initialize credentials volume", authVolumeInitializationArgs()...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func authVolumeInitializationArgs() []string {
+	return []string{
+		"run", "--rm",
+		"--network", "none",
+		"--user", "0:0",
+		"--read-only",
+		"--cap-drop", "ALL",
+		"--cap-add", "CHOWN",
+		"--cap-add", "DAC_OVERRIDE",
+		"--cap-add", "FOWNER",
+		"--security-opt", "no-new-privileges",
+		"--pids-limit", "32",
+		"--cpus", "0.25",
+		"--memory", "64m",
+		"--restart", "no",
+		"--log-driver", "none",
+		"--mount", "type=volume,src=" + authCredentialsVolume + ",dst=/vibedock/credentials",
+		"--entrypoint", "/bin/sh",
+		authHelperImage(),
+		"-ec", "if [ ! -L /vibedock/credentials/.vibedock-initialized ] && [ -f /vibedock/credentials/.vibedock-initialized ] && [ \"$(/usr/bin/stat -c %u:%g:%a /vibedock/credentials)\" = 1001:1001:700 ] && [ \"$(/usr/bin/stat -c %u:%g:%a /vibedock/credentials/.vibedock-initialized)\" = 1001:1001:600 ]; then exit 0; fi; /usr/bin/chmod 0700 /vibedock/credentials && /usr/bin/chown 1001:1001 /vibedock/credentials && temporary=$(/usr/bin/mktemp /vibedock/credentials/.vibedock-initializing.XXXXXX) && /usr/bin/chmod 0600 \"$temporary\" && /usr/bin/chown 1001:1001 \"$temporary\" && /usr/bin/mv -f \"$temporary\" /vibedock/credentials/.vibedock-initialized",
+	}
 }
 
 func (r *Runtime) authProtocol(ctx context.Context) error {
@@ -219,7 +238,7 @@ func (r *Runtime) authProtocol(ctx context.Context) error {
 	if err := r.authOneShotJSON(ctx, false, "protocol", nil, &manifest); err != nil {
 		return err
 	}
-	if manifest.Protocol != authHelperProtocol || manifest.CodexVersion != "0.144.6" || manifest.ClaudeVersion != "2.1.215" || manifest.TTydVersion != "1.7.7" {
+	if manifest.Protocol != authHelperProtocol {
 		return errors.New("authentication helper protocol incompatible")
 	}
 	return nil
@@ -233,22 +252,6 @@ func (r *Runtime) authOneShotJSONInput(ctx context.Context, network bool, operat
 	args := []string{"run", "--rm"}
 	if input != "" {
 		args = append(args, "-i")
-	}
-	if network && (operation == "status" || operation == "logout") {
-		accountID, accountOK := authOperationArg(operationArgs, "--account")
-		provider, providerOK := authOperationArg(operationArgs, "--provider")
-		if !accountOK || !providerOK || validateAuthAccount(accountID) != nil || validateAuthProvider(model.AuthProvider(provider)) != nil {
-			return errors.New("invalid authentication helper operation")
-		}
-		args = append(args,
-			"--label", "vibedock.managed=true",
-			"--label", "vibedock.auth_helper=true",
-			"--label", "vibedock.auth_operation="+operation,
-			"--label", "vibedock.auth_account="+accountID,
-			"--label", "vibedock.auth_provider="+provider,
-			"--label", "vibedock.auth_expires="+strconv.FormatInt(time.Now().Add(2*time.Minute).Unix(), 10),
-			"--label", "vibedock.auth_protocol="+strconv.Itoa(authHelperProtocol),
-		)
 	}
 	args = append(args, authOneShotDockerArgs(r.Network, network)...)
 	args = append(args, "--entrypoint", authHelperEntrypoint, authHelperImage(), operation)
@@ -301,6 +304,9 @@ func (r *Runtime) ListAccountConfig(ctx model.Context, accountID string, provide
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
 	defer cancel()
+	if err := r.authEnsureStorage(cctx); err != nil {
+		return nil, err
+	}
 	if err := r.authOneShotJSON(cctx, false, "config-list", []string{"--account", accountID, "--provider", string(provider)}, &response); err != nil {
 		return nil, err
 	}
@@ -328,6 +334,9 @@ func (r *Runtime) ReadAccountConfig(ctx model.Context, accountID string, provide
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
 	defer cancel()
+	if err := r.authEnsureStorage(cctx); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
 	if err := r.authOneShotJSON(cctx, false, "config-read", []string{"--account", accountID, "--provider", string(provider), "--path", path}, &response); err != nil {
 		return model.AccountConfigDocument{}, err
 	}
@@ -358,6 +367,9 @@ func (r *Runtime) WriteAccountConfig(ctx model.Context, accountID string, provid
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
 	defer cancel()
+	if err := r.authEnsureStorage(cctx); err != nil {
+		return model.AccountConfigDocument{}, err
+	}
 	if err := r.authOneShotJSONInput(cctx, false, "config-write", []string{"--account", accountID, "--provider", string(provider), "--path", path}, content, &response); err != nil {
 		return model.AccountConfigDocument{}, err
 	}
@@ -383,6 +395,9 @@ func (r *Runtime) ResetAccountConfig(ctx model.Context, accountID string, provid
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
 	defer cancel()
+	if err := r.authEnsureStorage(cctx); err != nil {
+		return err
+	}
 	if err := r.authOneShotJSON(cctx, false, "config-reset", []string{"--account", accountID, "--provider", string(provider), "--path", path}, &response); err != nil {
 		return err
 	}
@@ -390,15 +405,6 @@ func (r *Runtime) ResetAccountConfig(ctx model.Context, accountID string, provid
 		return errors.New("configuration helper protocol incompatible")
 	}
 	return nil
-}
-
-func authOperationArg(args []string, name string) (string, bool) {
-	for index := 0; index+1 < len(args); index++ {
-		if args[index] == name {
-			return args[index+1], true
-		}
-	}
-	return "", false
 }
 
 func (r *Runtime) authRun(ctx context.Context, operation string, args ...string) (string, error) {
@@ -435,73 +441,58 @@ func (r *Runtime) StartAuth(ctx model.Context, request model.AuthStartRequest) (
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 45*time.Second)
 	defer cancel()
-	if err := r.authPrerequisites(cctx, true); err != nil {
+	if err := r.authPrerequisites(cctx, false); err != nil {
 		return model.AuthRuntimeAttempt{}, err
 	}
 	ref := request.AuthAttemptRef
-	name := authContainerName(ref)
-	password := ""
-	if ref.Provider == model.AuthProviderClaude {
-		var err error
-		password, err = authTerminalPassword()
-		if err != nil {
-			return model.AuthRuntimeAttempt{}, err
-		}
-	}
-	args := []string{"create", "--name", name}
-	args = append(args, authBaseDockerArgs(r.Network)...)
-	args = append(args,
-		"--label", "vibedock.managed=true",
-		"--label", "vibedock.auth_helper=true",
-		"--label", "vibedock.auth_account="+ref.AccountID,
-		"--label", "vibedock.auth_attempt="+ref.AttemptID,
-		"--label", "vibedock.auth_provider="+string(ref.Provider),
-		"--label", "vibedock.auth_expires="+strconv.FormatInt(request.ExpiresAt.Unix(), 10),
-		"--label", "vibedock.auth_protocol="+strconv.Itoa(authHelperProtocol),
-	)
-	args = append(args,
-		"--entrypoint", authHelperEntrypoint,
-		authHelperImage(),
-		"login",
+	var state authHelperState
+	if err := r.authOneShotJSON(cctx, false, "login", []string{
 		"--provider", string(ref.Provider),
 		"--account", ref.AccountID,
 		"--attempt", ref.AttemptID,
 		"--expires-at", strconv.FormatInt(request.ExpiresAt.Unix(), 10),
-	)
-	if _, err := r.authRun(cctx, "create login container", args...); err != nil {
+	}, &state); err != nil {
 		return model.AuthRuntimeAttempt{}, err
 	}
-	created := true
-	defer func() {
-		if created {
-			_, _ = r.authRun(context.Background(), "remove login container", "rm", "-f", name)
-		}
-	}()
-	if _, err := r.authRun(cctx, "start login container", "start", name); err != nil {
+	attempt, err := validateAuthHelperState(ref, state)
+	if err != nil {
 		return model.AuthRuntimeAttempt{}, err
 	}
-	if password != "" {
-		execArgs := []string{"exec", "-i", "--user", "1001:1001", name, authHelperEntrypoint, "terminal-secret"}
-		if _, err := r.authRunWithInput(cctx, "stage login terminal credential", password+"\n", execArgs...); err != nil {
-			return model.AuthRuntimeAttempt{}, err
-		}
-		authTerminalSecrets.Store(authSecretKey(ref), password)
+	if attempt.State != model.AuthAttemptAwaitingUser {
+		return model.AuthRuntimeAttempt{}, errors.New("authentication helper did not start authorization")
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		attempt, err := r.inspectAuth(cctx, ref)
-		if err == nil {
-			created = false
-			return attempt, nil
-		}
-		if time.Now().After(deadline) || cctx.Err() != nil {
-			if password != "" {
-				authTerminalSecrets.Delete(authSecretKey(ref))
-			}
-			return model.AuthRuntimeAttempt{}, errors.New("authentication helper did not become ready")
-		}
-		time.Sleep(100 * time.Millisecond)
+	return attempt, nil
+}
+
+func (r *Runtime) CompleteAuth(ctx model.Context, request model.AuthCompleteRequest) (model.AuthRuntimeAttempt, error) {
+	if err := validateAuthRef(request.AuthAttemptRef); err != nil {
+		return model.AuthRuntimeAttempt{}, err
 	}
+	if request.AuthorizationResponse == "" || len(request.AuthorizationResponse) > authResponseLimit || strings.IndexByte(request.AuthorizationResponse, 0) >= 0 {
+		return model.AuthRuntimeAttempt{}, errors.New("invalid authorization response")
+	}
+	cctx, cancel := context.WithTimeout(asContext(ctx), 75*time.Second)
+	defer cancel()
+	if err := r.authPrerequisites(cctx, true); err != nil {
+		return model.AuthRuntimeAttempt{}, err
+	}
+	ref := request.AuthAttemptRef
+	var state authHelperState
+	if err := r.authOneShotJSONInput(cctx, true, "complete", []string{
+		"--provider", string(ref.Provider),
+		"--account", ref.AccountID,
+		"--attempt", ref.AttemptID,
+	}, request.AuthorizationResponse, &state); err != nil {
+		return model.AuthRuntimeAttempt{}, err
+	}
+	attempt, err := validateAuthHelperState(ref, state)
+	if err != nil {
+		return model.AuthRuntimeAttempt{}, err
+	}
+	if !attempt.State.Terminal() {
+		return model.AuthRuntimeAttempt{}, errors.New("authentication helper did not finish authorization")
+	}
+	return attempt, nil
 }
 
 func (r *Runtime) InspectAuth(ctx model.Context, ref model.AuthAttemptRef) (model.AuthRuntimeAttempt, error) {
@@ -510,14 +501,7 @@ func (r *Runtime) InspectAuth(ctx model.Context, ref model.AuthAttemptRef) (mode
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 10*time.Second)
 	defer cancel()
-	attempt, err := r.inspectAuth(cctx, ref)
-	if err != nil {
-		return model.AuthRuntimeAttempt{}, err
-	}
-	if attempt.State.Terminal() {
-		authTerminalSecrets.Delete(authSecretKey(ref))
-	}
-	return attempt, nil
+	return r.inspectAuth(cctx, ref)
 }
 
 func (r *Runtime) inspectAuth(ctx context.Context, ref model.AuthAttemptRef) (model.AuthRuntimeAttempt, error) {
@@ -527,6 +511,10 @@ func (r *Runtime) inspectAuth(ctx context.Context, ref model.AuthAttemptRef) (mo
 	}, &state); err != nil {
 		return model.AuthRuntimeAttempt{}, err
 	}
+	return validateAuthHelperState(ref, state)
+}
+
+func validateAuthHelperState(ref model.AuthAttemptRef, state authHelperState) (model.AuthRuntimeAttempt, error) {
 	if state.Protocol != authHelperProtocol || state.AccountID != ref.AccountID || state.AttemptID != ref.AttemptID || state.Provider != string(ref.Provider) {
 		return model.AuthRuntimeAttempt{}, errors.New("authentication helper returned mismatched state")
 	}
@@ -539,12 +527,14 @@ func (r *Runtime) inspectAuth(ctx context.Context, ref model.AuthAttemptRef) (mo
 	if state.PollAfterMS < 1000 || state.PollAfterMS > 30000 || state.ExpiresAt <= 0 {
 		return model.AuthRuntimeAttempt{}, errors.New("authentication helper returned invalid timing")
 	}
-	if attemptState == model.AuthAttemptAwaitingUser && ref.Provider == model.AuthProviderCodex {
-		if err := validateCodexVerificationURL(state.VerificationURL); err != nil || !authUserCodePattern.MatchString(state.UserCode) {
-			return model.AuthRuntimeAttempt{}, errors.New("authentication helper returned unsafe device login data")
-		}
+	if state.UserCode != "" || state.TerminalAvailable {
+		return model.AuthRuntimeAttempt{}, errors.New("authentication helper returned obsolete login data")
 	}
-	if attemptState.Terminal() && (state.VerificationURL != "" || state.UserCode != "" || state.TerminalAvailable) {
+	if attemptState == model.AuthAttemptAwaitingUser {
+		if err := validateAuthorizationURL(ref.Provider, state.VerificationURL); err != nil {
+			return model.AuthRuntimeAttempt{}, errors.New("authentication helper returned unsafe authorization data")
+		}
+	} else if state.VerificationURL != "" {
 		return model.AuthRuntimeAttempt{}, errors.New("authentication helper retained transient login data")
 	}
 	return model.AuthRuntimeAttempt{
@@ -560,15 +550,65 @@ func (r *Runtime) inspectAuth(ctx context.Context, ref model.AuthAttemptRef) (mo
 	}, nil
 }
 
-func validateCodexVerificationURL(value string) error {
-	if len(value) < 12 || len(value) > 256 {
+func validateAuthorizationURL(provider model.AuthProvider, value string) error {
+	if len(value) < 32 || len(value) > 4096 {
 		return errors.New("invalid verification URL")
 	}
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host != "auth.openai.com" || parsed.Path != "/codex/device" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+	if err != nil || parsed.Scheme != "https" || parsed.Fragment != "" || parsed.User != nil || parsed.RawPath != "" {
 		return errors.New("invalid verification URL")
 	}
 	if parsed.Port() != "" && parsed.Port() != "443" {
+		return errors.New("invalid verification URL")
+	}
+	expectedHost, expectedPath, expectedClient, expectedRedirect, expectedScopes := "", "", "", "", ""
+	providerParameters := map[string]string{}
+	switch provider {
+	case model.AuthProviderCodex:
+		expectedHost = "auth.openai.com"
+		expectedPath = "/oauth/authorize"
+		expectedClient = codexOAuthClientID
+		expectedRedirect = codexOAuthRedirectURI
+		expectedScopes = codexOAuthScopes
+		providerParameters["id_token_add_organizations"] = "true"
+		providerParameters["codex_cli_simplified_flow"] = "true"
+		providerParameters["originator"] = "codex_cli_rs"
+	case model.AuthProviderClaude:
+		expectedHost = "claude.com"
+		expectedPath = "/cai/oauth/authorize"
+		expectedClient = claudeOAuthClientID
+		expectedRedirect = claudeOAuthRedirectURI
+		expectedScopes = claudeOAuthScopes
+		providerParameters["code"] = "true"
+	default:
+		return errors.New("invalid verification URL")
+	}
+	if !strings.EqualFold(parsed.Hostname(), expectedHost) || parsed.Path != expectedPath {
+		return errors.New("invalid verification URL")
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return errors.New("invalid verification URL")
+	}
+	required := map[string]string{
+		"client_id":             expectedClient,
+		"redirect_uri":          expectedRedirect,
+		"response_type":         "code",
+		"code_challenge_method": "S256",
+		"scope":                 expectedScopes,
+	}
+	for key, value := range providerParameters {
+		required[key] = value
+	}
+	for key, expected := range required {
+		values, ok := query[key]
+		if !ok || len(values) != 1 || values[0] != expected {
+			return errors.New("invalid verification URL")
+		}
+	}
+	state := query["state"]
+	challenge := query["code_challenge"]
+	if len(state) != 1 || !authOAuthPattern.MatchString(state[0]) || len(challenge) != 1 || len(challenge[0]) != 43 || !authOAuthPattern.MatchString(challenge[0]) {
 		return errors.New("invalid verification URL")
 	}
 	return nil
@@ -578,14 +618,23 @@ func (r *Runtime) CancelAuth(ctx model.Context, ref model.AuthAttemptRef) error 
 	if err := validateAuthRef(ref); err != nil {
 		return err
 	}
-	cctx, cancel := context.WithTimeout(asContext(ctx), 15*time.Second)
+	cctx, cancel := context.WithTimeout(asContext(ctx), 30*time.Second)
 	defer cancel()
-	name := authContainerName(ref)
-	_, stopErr := r.authRun(cctx, "stop login container", "stop", "--time", "5", name)
-	_, removeErr := r.authRun(cctx, "remove login container", "rm", "-f", name)
-	authTerminalSecrets.Delete(authSecretKey(ref))
-	if stopErr != nil && removeErr != nil {
-		return errors.New("authentication helper cancellation failed")
+	if err := r.authPrerequisites(cctx, false); err != nil {
+		return err
+	}
+	var state authHelperState
+	if err := r.authOneShotJSON(cctx, false, "cancel", []string{
+		"--provider", string(ref.Provider), "--account", ref.AccountID, "--attempt", ref.AttemptID,
+	}, &state); err != nil {
+		return err
+	}
+	attempt, err := validateAuthHelperState(ref, state)
+	if err != nil {
+		return err
+	}
+	if !attempt.State.Terminal() {
+		return errors.New("authentication helper did not cancel authorization")
 	}
 	return nil
 }
@@ -597,13 +646,13 @@ func (r *Runtime) AuthStatus(ctx model.Context, request model.AuthStatusRequest)
 	if err := validateAuthProvider(request.Provider); err != nil {
 		return model.AuthStatusResult{}, err
 	}
-	cctx, cancel := context.WithTimeout(asContext(ctx), 45*time.Second)
+	cctx, cancel := context.WithTimeout(asContext(ctx), 30*time.Second)
 	defer cancel()
-	if err := r.authPrerequisites(cctx, true); err != nil {
+	if err := r.authPrerequisites(cctx, false); err != nil {
 		return model.AuthStatusResult{}, err
 	}
 	var status authHelperStatus
-	if err := r.authOneShotJSON(cctx, true, "status", []string{"--provider", string(request.Provider), "--account", request.AccountID}, &status); err != nil {
+	if err := r.authOneShotJSON(cctx, false, "status", []string{"--provider", string(request.Provider), "--account", request.AccountID}, &status); err != nil {
 		return model.AuthStatusResult{}, err
 	}
 	if status.Protocol != authHelperProtocol || status.CheckedAt <= 0 {
@@ -625,13 +674,13 @@ func (r *Runtime) LogoutAuth(ctx model.Context, request model.AuthLogoutRequest)
 	if err := validateAuthProvider(request.Provider); err != nil {
 		return model.AuthLogoutResult{}, err
 	}
-	cctx, cancel := context.WithTimeout(asContext(ctx), 60*time.Second)
+	cctx, cancel := context.WithTimeout(asContext(ctx), 30*time.Second)
 	defer cancel()
-	if err := r.authPrerequisites(cctx, true); err != nil {
+	if err := r.authPrerequisites(cctx, false); err != nil {
 		return model.AuthLogoutResult{}, err
 	}
 	var result authHelperLogout
-	if err := r.authOneShotJSON(cctx, true, "logout", []string{"--provider", string(request.Provider), "--account", request.AccountID}, &result); err != nil {
+	if err := r.authOneShotJSON(cctx, false, "logout", []string{"--provider", string(request.Provider), "--account", request.AccountID}, &result); err != nil {
 		return model.AuthLogoutResult{}, err
 	}
 	if result.Protocol != authHelperProtocol || !result.LocalCredentialsRemoved {
@@ -642,49 +691,6 @@ func (r *Runtime) LogoutAuth(ctx model.Context, request model.AuthLogoutRequest)
 		ProviderLogoutConfirmed: result.ProviderLogoutConfirmed,
 		Message:                 result.Message,
 	}, nil
-}
-
-func (r *Runtime) AuthTerminal(ctx model.Context, ref model.AuthAttemptRef) (model.AuthTerminalTarget, error) {
-	if err := validateAuthRef(ref); err != nil {
-		return model.AuthTerminalTarget{}, err
-	}
-	if ref.Provider != model.AuthProviderClaude {
-		return model.AuthTerminalTarget{}, errors.New("authentication attempt has no terminal")
-	}
-	passwordValue, ok := authTerminalSecrets.Load(authSecretKey(ref))
-	if !ok {
-		return model.AuthTerminalTarget{}, errors.New("authentication terminal is unavailable")
-	}
-	password, ok := passwordValue.(string)
-	if !ok || password == "" {
-		return model.AuthTerminalTarget{}, errors.New("authentication terminal is unavailable")
-	}
-	cctx, cancel := context.WithTimeout(asContext(ctx), 10*time.Second)
-	defer cancel()
-	inspect, err := r.authInspectContainer(cctx, authContainerName(ref))
-	if err != nil {
-		return model.AuthTerminalTarget{}, err
-	}
-	if !inspect.State.Running || inspect.State.Status != "running" || !authLabelsMatch(inspect.Config.Labels, ref) {
-		return model.AuthTerminalTarget{}, errors.New("authentication terminal is unavailable")
-	}
-	ip := ""
-	if network, ok := inspect.NetworkSettings.Networks[r.Network]; ok {
-		ip = network.IPAddress
-	}
-	if net.ParseIP(ip) == nil {
-		return model.AuthTerminalTarget{}, errors.New("authentication terminal has no reachable address")
-	}
-	return model.AuthTerminalTarget{URL: "http://" + net.JoinHostPort(ip, strconv.Itoa(authTerminalPort)), Username: "vibe", Password: password}, nil
-}
-
-func authLabelsMatch(labels map[string]string, ref model.AuthAttemptRef) bool {
-	return labels["vibedock.managed"] == "true" &&
-		labels["vibedock.auth_helper"] == "true" &&
-		labels["vibedock.auth_account"] == ref.AccountID &&
-		labels["vibedock.auth_attempt"] == ref.AttemptID &&
-		labels["vibedock.auth_provider"] == string(ref.Provider) &&
-		labels["vibedock.auth_protocol"] == strconv.Itoa(authHelperProtocol)
 }
 
 func (r *Runtime) authInspectContainer(ctx context.Context, name string) (authContainerInspect, error) {
@@ -793,12 +799,8 @@ func (r *Runtime) ReconcileAuth(ctx model.Context, now time.Time) error {
 			continue
 		}
 		_, _ = r.authRun(cctx, "remove stale login container", "rm", "-f", containerID)
-		authTerminalSecrets.Delete(authSecretKey(ref))
 	}
-	if _, err := r.authRun(cctx, "create credentials volume", "volume", "create", authCredentialsVolume); err != nil {
-		return err
-	}
-	if err := r.authProtocol(cctx); err != nil {
+	if err := r.authPrerequisites(cctx, false); err != nil {
 		return err
 	}
 	var result struct {

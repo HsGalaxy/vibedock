@@ -3,12 +3,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -19,18 +21,21 @@ import (
 )
 
 type fakeAuthRuntime struct {
-	mu          sync.Mutex
-	started     []model.AuthStartRequest
-	cancelled   []model.AuthAttemptRef
-	attempts    map[string]model.AuthRuntimeAttempt
-	statuses    map[string]model.AuthStatusResult
-	logout      model.AuthLogoutResult
-	cleanups    []model.AuthCredentialCleanup
-	committed   []model.AuthCredentialCleanup
-	rolledBack  []model.AuthCredentialCleanup
-	prepareErr  error
-	commitErr   error
-	rollbackErr error
+	mu                 sync.Mutex
+	started            []model.AuthStartRequest
+	completed          []model.AuthCompleteRequest
+	cancelled          []model.AuthAttemptRef
+	attempts           map[string]model.AuthRuntimeAttempt
+	statuses           map[string]model.AuthStatusResult
+	logout             model.AuthLogoutResult
+	completeErr        error
+	completeContextErr error
+	cleanups           []model.AuthCredentialCleanup
+	committed          []model.AuthCredentialCleanup
+	rolledBack         []model.AuthCredentialCleanup
+	prepareErr         error
+	commitErr          error
+	rollbackErr        error
 }
 
 func (f *fakeAuthRuntime) StartAuth(_ context.Context, request model.AuthStartRequest) (model.AuthRuntimeAttempt, error) {
@@ -41,13 +46,12 @@ func (f *fakeAuthRuntime) StartAuth(_ context.Context, request model.AuthStartRe
 		State:          model.AuthAttemptAwaitingUser,
 		ExpiresAt:      request.ExpiresAt,
 		PollAfter:      time.Second,
-		Message:        "等待官方登录",
+		Message:        "等待官方授权",
 	}
 	if request.Provider == model.AuthProviderCodex {
-		attempt.VerificationURL = "https://auth.openai.com/deviceauth"
-		attempt.UserCode = "ABCD-EFGH"
+		attempt.VerificationURL = "https://auth.openai.com/oauth/authorize?client_id=test"
 	} else {
-		attempt.TerminalAvailable = true
+		attempt.VerificationURL = "https://claude.com/cai/oauth/authorize?client_id=test"
 	}
 	f.started = append(f.started, request)
 	if f.attempts == nil {
@@ -57,9 +61,36 @@ func (f *fakeAuthRuntime) StartAuth(_ context.Context, request model.AuthStartRe
 	return attempt, nil
 }
 
-func (f *fakeAuthRuntime) InspectAuth(_ context.Context, reference model.AuthAttemptRef) (model.AuthRuntimeAttempt, error) {
+func (f *fakeAuthRuntime) CompleteAuth(ctx context.Context, request model.AuthCompleteRequest) (model.AuthRuntimeAttempt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.completeContextErr = ctx.Err()
+	if f.completeContextErr != nil {
+		return model.AuthRuntimeAttempt{}, f.completeContextErr
+	}
+	f.completed = append(f.completed, request)
+	attempt, ok := f.attempts[request.AttemptID]
+	if !ok {
+		return model.AuthRuntimeAttempt{}, os.ErrNotExist
+	}
+	attempt.State = model.AuthAttemptCompleted
+	attempt.VerificationURL = ""
+	attempt.UserCode = ""
+	attempt.TerminalAvailable = false
+	attempt.Message = "授权完成"
+	f.attempts[request.AttemptID] = attempt
+	if f.completeErr != nil {
+		return model.AuthRuntimeAttempt{}, f.completeErr
+	}
+	return attempt, nil
+}
+
+func (f *fakeAuthRuntime) InspectAuth(ctx context.Context, reference model.AuthAttemptRef) (model.AuthRuntimeAttempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return model.AuthRuntimeAttempt{}, err
+	}
 	attempt, ok := f.attempts[reference.AttemptID]
 	if !ok {
 		return model.AuthRuntimeAttempt{}, os.ErrNotExist
@@ -95,10 +126,6 @@ func (f *fakeAuthRuntime) LogoutAuth(context.Context, model.AuthLogoutRequest) (
 		return model.AuthLogoutResult{LocalCredentialsRemoved: true}, nil
 	}
 	return f.logout, nil
-}
-
-func (f *fakeAuthRuntime) AuthTerminal(context.Context, model.AuthAttemptRef) (model.AuthTerminalTarget, error) {
-	return model.AuthTerminalTarget{URL: "http://127.0.0.1:7681", Username: "vibe", Password: "internal-only"}, nil
 }
 
 func (f *fakeAuthRuntime) PrepareAuthCredentialCleanup(_ context.Context, accountID string) (model.AuthCredentialCleanup, error) {
@@ -150,7 +177,11 @@ func authAccount(id, agent string) model.AccountProfile {
 }
 
 func authMutationRequest(method, path string) *http.Request {
-	request := httptest.NewRequest(method, path, bytes.NewBufferString("{}"))
+	return authMutationJSONRequest(method, path, "{}")
+}
+
+func authMutationJSONRequest(method, path, body string) *http.Request {
+	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-VibeDock-Request", "account-auth")
 	request.Header.Set("Origin", "http://example.com")
@@ -181,8 +212,8 @@ func TestAccountLoginAttemptAPIIsIdempotentAndNoStore(t *testing.T) {
 	if started != 1 {
 		t.Fatalf("StartAuth called %d times, want 1", started)
 	}
-	if !bytes.Contains(first.Body.Bytes(), []byte("ABCD-EFGH")) || !bytes.Contains(first.Body.Bytes(), []byte("https://auth.openai.com/deviceauth")) {
-		t.Fatalf("active attempt omitted device flow data: %s", first.Body.String())
+	if !bytes.Contains(first.Body.Bytes(), []byte(`"flow":"authorization_code"`)) || !bytes.Contains(first.Body.Bytes(), []byte("https://auth.openai.com/oauth/authorize")) || bytes.Contains(first.Body.Bytes(), []byte("user_code")) {
+		t.Fatalf("active attempt omitted authorization flow data: %s", first.Body.String())
 	}
 }
 
@@ -229,7 +260,7 @@ func TestAccountLoginStatusReportsActiveAttempt(t *testing.T) {
 	handler.ServeHTTP(start, authMutationRequest(http.MethodPost, "http://example.com/api/accounts/acct12345678/login-attempts"))
 	status := httptest.NewRecorder()
 	handler.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "http://example.com/api/accounts/acct12345678/auth-status", nil))
-	if status.Code != http.StatusOK || !bytes.Contains(status.Body.Bytes(), []byte(`"state":"login_in_progress"`)) || !bytes.Contains(status.Body.Bytes(), []byte(`"terminal_url"`)) {
+	if status.Code != http.StatusOK || !bytes.Contains(status.Body.Bytes(), []byte(`"state":"login_in_progress"`)) || !bytes.Contains(status.Body.Bytes(), []byte("https://claude.com/cai/oauth/authorize")) {
 		t.Fatalf("unexpected active status: %d %s", status.Code, status.Body.String())
 	}
 }
@@ -254,12 +285,112 @@ func TestAccountLoginAttemptCancelClearsSensitiveData(t *testing.T) {
 	}
 	inspect := httptest.NewRecorder()
 	handler.ServeHTTP(inspect, httptest.NewRequest(http.MethodGet, "http://example.com/api/accounts/acct12345678/login-attempts/"+attemptID, nil))
-	if inspect.Code != http.StatusOK || bytes.Contains(inspect.Body.Bytes(), []byte("ABCD-EFGH")) || bytes.Contains(inspect.Body.Bytes(), []byte("auth.openai.com")) {
+	if inspect.Code != http.StatusOK || bytes.Contains(inspect.Body.Bytes(), []byte("auth.openai.com")) {
 		t.Fatalf("terminal attempt leaked transient data: %d %s", inspect.Code, inspect.Body.String())
 	}
 }
 
-func TestAccountLoginAttemptExpiryCancelsRuntime(t *testing.T) {
+func TestAccountLoginCompleteAcceptsAuthorizationResponse(t *testing.T) {
+	runtime := &fakeAuthRuntime{}
+	_, handler := newAuthTestServer(t, runtime, authAccount("acct12345678", "codex"))
+	start := httptest.NewRecorder()
+	handler.ServeHTTP(start, authMutationRequest(http.MethodPost, "http://example.com/api/accounts/acct12345678/login-attempts"))
+	marker := `"id":"`
+	position := strings.Index(start.Body.String(), marker)
+	if position < 0 {
+		t.Fatalf("missing attempt ID: %s", start.Body.String())
+	}
+	attemptID := start.Body.String()[position+len(marker) : position+len(marker)+24]
+	callback := "http://localhost:1455/auth/callback?code=provider-code&state=oauth-state"
+	complete := httptest.NewRecorder()
+	request := authMutationJSONRequest(http.MethodPost, "http://example.com/api/accounts/acct12345678/login-attempts/"+attemptID+"/complete", `{"authorization_response":"`+callback+`"}`)
+	handler.ServeHTTP(complete, request)
+	if complete.Code != http.StatusOK || !bytes.Contains(complete.Body.Bytes(), []byte(`"state":"completed"`)) || bytes.Contains(complete.Body.Bytes(), []byte("verification_url")) {
+		t.Fatalf("complete status = %d, body = %s", complete.Code, complete.Body.String())
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.completed) != 1 || runtime.completed[0].AuthorizationResponse != callback {
+		t.Fatalf("unexpected completion request: %#v", runtime.completed)
+	}
+}
+
+func TestAccountLoginCompleteRecoversAfterRuntimeTimeout(t *testing.T) {
+	runtime := &fakeAuthRuntime{completeErr: errors.New("timeout after credential commit")}
+	_, handler := newAuthTestServer(t, runtime, authAccount("acct12345678", "codex"))
+	start := httptest.NewRecorder()
+	handler.ServeHTTP(start, authMutationRequest(http.MethodPost, "http://example.com/api/accounts/acct12345678/login-attempts"))
+	marker := `"id":"`
+	position := strings.Index(start.Body.String(), marker)
+	attemptID := start.Body.String()[position+len(marker) : position+len(marker)+24]
+	complete := httptest.NewRecorder()
+	handler.ServeHTTP(complete, authMutationJSONRequest(http.MethodPost, "http://example.com/api/accounts/acct12345678/login-attempts/"+attemptID+"/complete", `{"authorization_response":"http://localhost:1455/auth/callback?code=ok&state=ok"}`))
+	if complete.Code != http.StatusOK || !bytes.Contains(complete.Body.Bytes(), []byte(`"state":"completed"`)) {
+		t.Fatalf("committed credentials were reported as timeout: %d %s", complete.Code, complete.Body.String())
+	}
+}
+
+func TestAccountLoginCompleteSurvivesClientCancellation(t *testing.T) {
+	runtime := &fakeAuthRuntime{}
+	manager := newAccountAuthManager(runtime, AccountAuthOptions{Enabled: true, TTL: 15 * time.Minute, MaxConcurrent: 3})
+	attempt, _, err := manager.start(context.Background(), "acct12345678", model.AuthProviderCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	completed, err := manager.complete(requestContext, "acct12345678", attempt.AttemptID, model.AuthProviderCodex, "http://localhost:1455/auth/callback?code=ok&state=ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != model.AuthAttemptCompleted {
+		t.Fatalf("completion was lost after client cancellation: %#v", completed)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.completeContextErr != nil {
+		t.Fatalf("runtime received cancelled request context: %v", runtime.completeContextErr)
+	}
+}
+
+func TestAccountAuthClosePreservesRecoverableAttempt(t *testing.T) {
+	runtime := &fakeAuthRuntime{}
+	manager := newAccountAuthManager(runtime, AccountAuthOptions{Enabled: true, TTL: 15 * time.Minute, MaxConcurrent: 3})
+	attempt, _, err := manager.start(context.Background(), "acct12345678", model.AuthProviderClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Close(context.Background())
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.cancelled) != 0 {
+		t.Fatalf("shutdown cancelled persisted authorization: %#v", runtime.cancelled)
+	}
+	if runtime.attempts[attempt.AttemptID].State != model.AuthAttemptAwaitingUser {
+		t.Fatalf("shutdown changed recoverable authorization: %#v", runtime.attempts[attempt.AttemptID])
+	}
+}
+
+func TestAccountLoginAttemptCanBeRecoveredFromRuntime(t *testing.T) {
+	const attemptID = "attempt12345678901234567"
+	runtime := &fakeAuthRuntime{attempts: map[string]model.AuthRuntimeAttempt{
+		attemptID: {
+			AuthAttemptRef:  model.AuthAttemptRef{AccountID: "acct12345678", AttemptID: attemptID, Provider: model.AuthProviderClaude},
+			State:           model.AuthAttemptAwaitingUser,
+			VerificationURL: "https://claude.com/cai/oauth/authorize?client_id=test",
+			ExpiresAt:       time.Now().UTC().Add(10 * time.Minute),
+			PollAfter:       2 * time.Second,
+		},
+	}}
+	_, handler := newAuthTestServer(t, runtime, authAccount("acct12345678", "claude"))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://example.com/api/accounts/acct12345678/login-attempts/"+attemptID, nil))
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte("https://claude.com/cai/oauth/authorize")) {
+		t.Fatalf("persisted attempt was not recovered: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccountLoginAttemptCompletionWinsOverCachedExpiry(t *testing.T) {
 	runtime := &fakeAuthRuntime{}
 	manager := newAccountAuthManager(runtime, AccountAuthOptions{Enabled: true, TTL: 15 * time.Minute, MaxConcurrent: 3})
 	attempt, _, err := manager.start(context.Background(), "acct12345678", model.AuthProviderCodex)
@@ -269,14 +400,17 @@ func TestAccountLoginAttemptExpiryCancelsRuntime(t *testing.T) {
 	manager.mu.Lock()
 	manager.attempts[attempt.AttemptID].view.ExpiresAt = time.Now().Add(-time.Second)
 	manager.mu.Unlock()
-	current := manager.current("acct12345678")
-	if current == nil || current.State != model.AuthAttemptExpired || current.VerificationURL != "" || current.UserCode != "" {
-		t.Fatalf("unexpected expired attempt: %#v", current)
-	}
 	runtime.mu.Lock()
-	cancelled := len(runtime.cancelled)
+	completed := runtime.attempts[attempt.AttemptID]
+	completed.State = model.AuthAttemptCompleted
+	completed.VerificationURL = ""
+	runtime.attempts[attempt.AttemptID] = completed
 	runtime.mu.Unlock()
-	if cancelled != 1 {
-		t.Fatalf("CancelAuth called %d times, want 1", cancelled)
+	fresh, err := manager.inspect(context.Background(), "acct12345678", attempt.AttemptID, model.AuthProviderCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.State != model.AuthAttemptCompleted {
+		t.Fatalf("persisted completion was overwritten: %#v", fresh)
 	}
 }
