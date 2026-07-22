@@ -43,6 +43,10 @@ ATTEMPT_RE = re.compile(r"^[a-z0-9]{24}$")
 CLEANUP_RE = re.compile(r"^[a-z0-9]{32}$")
 PROVIDERS = {"codex", "claude"}
 CONFIG_FILES = {"codex": ("config.toml",), "claude": ("settings.json",)}
+DEFAULT_CONFIG_CONTENT = {
+    "codex": "# Optional Codex settings. Add overrides below, then save.\n",
+    "claude": "{}\n",
+}
 MAX_CONFIG_BYTES = 256 << 10
 MAX_AUTH_RESPONSE_BYTES = 8192
 TERMINAL_STATES = {"completed", "cancelled", "expired", "failed"}
@@ -334,7 +338,13 @@ def _read_config(root: Path, account: str, provider: str, name: str) -> dict[str
     try:
         info = os.lstat(path)
     except FileNotFoundError:
-        return {"protocol": PROTOCOL_VERSION, "path": name, "exists": False, "content": ""}
+        return {
+            "protocol": PROTOCOL_VERSION,
+            "path": name,
+            "exists": False,
+            "content": "",
+            "default_content": DEFAULT_CONFIG_CONTENT[provider],
+        }
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
         raise HelperError("config_invalid")
     try:

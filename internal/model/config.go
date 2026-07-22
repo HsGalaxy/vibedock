@@ -8,9 +8,10 @@ type AccountConfigFile struct {
 }
 
 type AccountConfigDocument struct {
-	Path    string `json:"path"`
-	Exists  bool   `json:"exists"`
-	Content string `json:"content"`
+	Path           string `json:"path"`
+	Exists         bool   `json:"exists"`
+	Content        string `json:"content"`
+	DefaultContent string `json:"default_content,omitempty"`
 }
 
 // AccountConfigRuntime exposes only provider-specific allowlisted text files.

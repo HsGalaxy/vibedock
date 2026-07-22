@@ -426,7 +426,7 @@
   </dialog>
 
   <dialog id="accountConfigDialog" class="modal wide-modal">
-    <div class="dialog-header"><div><div class="eyebrow">ACCOUNT CONFIGURATION</div><h3 id="accountConfigTitle">账号配置文件</h3><p>仅显示允许编辑的非认证配置文件；登录凭据、历史和缓存不会出现在这里。</p></div><button type="button" class="icon-button" data-close="accountConfigDialog">×</button></div>
+    <div class="dialog-header"><div><div class="eyebrow">ACCOUNT CONFIGURATION</div><h3 id="accountConfigTitle">账号配置文件</h3><p>登录只更新单独保护的凭据文件；这里仅显示可选的非认证配置。未自定义时 Agent 会使用内置默认配置。</p></div><button type="button" class="icon-button" data-close="accountConfigDialog">×</button></div>
     <div class="account-config-layout">
       <nav id="accountConfigTree" class="config-tree" aria-label="账号配置文件"></nav>
       <section class="account-config-editor">
@@ -493,6 +493,7 @@
   </dialog>
   <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
   <script src="/account-auth.js" defer></script>
+  <script src="/terminal-clipboard.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

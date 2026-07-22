@@ -733,7 +733,9 @@ function createView(tab) {
     $('[data-start-workspace]', host).onclick = workspacePower;
   } else {
     host.innerHTML = `<div class="pane-loading"><span class="spinner"></span><b>正在连接 ${escapeHTML(tab.title)}…</b></div><iframe class="pane-frame" title="${escapeHTML(tab.title)}" allow="clipboard-read; clipboard-write; fullscreen; autoplay" src="${escapeHTML(tab.url)}"></iframe>`;
-    $('iframe', host).addEventListener('load', () => $('.pane-loading', host)?.classList.add('done'), {once:true});
+    const frame = $('iframe', host);
+    frame.addEventListener('load', () => $('.pane-loading', host)?.classList.add('done'), {once:true});
+    if (tab.kind === 'session') window.VibeDockTerminalClipboard?.attach(frame);
   }
   $('#paneViewLayer').append(host);
   const view = {key, tabID:tab.id, host, lastUsed:++state.viewClock, status:ws.status};
@@ -1236,6 +1238,18 @@ function renderAccounts() {
   updateControlAuthWarnings();
 }
 
+function accountConfigMetaLabel(exists, size) {
+  if (!exists) return '使用内置默认';
+  return Number.isFinite(size) ? `${size} bytes` : '已保存';
+}
+
+function updateAccountConfigFileMeta(path, exists, content = '') {
+  const button = [...$$('[data-config-path]', $('#accountConfigTree'))].find(item => item.dataset.configPath === path);
+  const detail = button?.querySelector('small');
+  if (detail) detail.textContent = accountConfigMetaLabel(exists, exists ? new TextEncoder().encode(content).byteLength : undefined);
+  $('#resetAccountConfig').disabled = !exists;
+}
+
 async function loadAccountConfigFile(path = state.accountConfigPath) {
   const accountID = state.accountConfigAccountID;
   if (!accountID || !path) return;
@@ -1245,8 +1259,9 @@ async function loadAccountConfigFile(path = state.accountConfigPath) {
   $('#accountConfigError').classList.add('hidden');
   try {
     const document = await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`);
-    $('#accountConfigContent').value = document.content || '';
-    $('#accountConfigState').textContent = document.exists ? '已存在 · 可编辑' : '文件尚未创建';
+    $('#accountConfigContent').value = document.exists ? (document.content || '') : (document.default_content || '');
+    $('#accountConfigState').textContent = document.exists ? '已保存 · 可编辑' : '未自定义 · 当前使用 Agent 内置默认配置，保存后创建此文件';
+    updateAccountConfigFileMeta(path, document.exists, document.content || '');
   } catch (error) {
     $('#accountConfigState').textContent = '读取失败';
     $('#accountConfigError').textContent = error.message;
@@ -1261,12 +1276,14 @@ async function openAccountConfig(accountID) {
   state.accountConfigPath = null;
   $('#accountConfigTitle').textContent = `${account.name} · 配置文件`;
   $('#accountConfigContent').value = '';
+  $('#accountConfigState').textContent = '读取中…';
+  $('#resetAccountConfig').disabled = true;
   $('#accountConfigError').classList.add('hidden');
   accountConfigDialog.showModal();
   try {
     const result = await api(`/api/accounts/${accountID}/config`);
     const tree = $('#accountConfigTree');
-    tree.innerHTML = (result.files || []).map(file => `<button type="button" data-config-path="${escapeHTML(file.path)}"><span>${escapeHTML(file.path)}</span><small>${file.exists ? `${file.size || 0} bytes` : '未创建'}</small></button>`).join('');
+    tree.innerHTML = (result.files || []).map(file => `<button type="button" data-config-path="${escapeHTML(file.path)}"><span>${escapeHTML(file.path)}</span><small>${accountConfigMetaLabel(file.exists, file.size)}</small></button>`).join('');
     const first = result.files?.[0]?.path;
     if (first) {
       tree.querySelector(`[data-config-path="${CSS.escape(first)}"]`)?.classList.add('selected');
@@ -1283,8 +1300,10 @@ async function saveAccountConfig() {
   const path = state.accountConfigPath;
   if (!accountID || !path) return;
   try {
-    await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`, {method:'PUT', headers:{'Content-Type':'application/json', [AUTH_REQUEST_HEADER]:'account-auth'}, body:JSON.stringify({content:$('#accountConfigContent').value})});
-    $('#accountConfigState').textContent = '已保存';
+    const document = await api(`/api/accounts/${accountID}/config/${encodeURIComponent(path)}`, {method:'PUT', headers:{'Content-Type':'application/json', [AUTH_REQUEST_HEADER]:'account-auth'}, body:JSON.stringify({content:$('#accountConfigContent').value})});
+    $('#accountConfigContent').value = document.content || '';
+    $('#accountConfigState').textContent = '已保存 · 可编辑';
+    updateAccountConfigFileMeta(path, true, document.content || '');
     showToast('账号配置文件已保存');
   } catch (error) {
     $('#accountConfigError').textContent = error.message;

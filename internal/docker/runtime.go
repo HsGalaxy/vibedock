@@ -452,14 +452,14 @@ func environmentSetupScript(setup model.EnvironmentSetup) string {
 func (r *Runtime) EnsureSession(ctx model.Context, containerName string, req model.SessionRuntimeRequest) error {
 	cctx, cancel := context.WithTimeout(asContext(ctx), 30*time.Second)
 	defer cancel()
-	_, err := r.runWithInput(cctx, sessionBootstrapScript(req, false), "exec", "-i", "-u", "coder", "-e", "HOME=/home/coder", "-e", "NPM_CONFIG_PREFIX=/home/coder/.local", "-e", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", containerName, "bash", "-s")
+	_, err := r.runWithInput(cctx, sessionBootstrapScript(req, false), "exec", "-i", "-u", "coder", "-e", "HOME=/home/coder", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-e", "NPM_CONFIG_PREFIX=/home/coder/.local", "-e", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", containerName, "bash", "-s")
 	return err
 }
 
 func (r *Runtime) RestartSession(ctx model.Context, containerName string, req model.SessionRuntimeRequest) error {
 	cctx, cancel := context.WithTimeout(asContext(ctx), 35*time.Second)
 	defer cancel()
-	_, err := r.runWithInput(cctx, sessionBootstrapScript(req, true), "exec", "-i", "-u", "coder", "-e", "HOME=/home/coder", "-e", "NPM_CONFIG_PREFIX=/home/coder/.local", "-e", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", containerName, "bash", "-s")
+	_, err := r.runWithInput(cctx, sessionBootstrapScript(req, true), "exec", "-i", "-u", "coder", "-e", "HOME=/home/coder", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8", "-e", "NPM_CONFIG_PREFIX=/home/coder/.local", "-e", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", containerName, "bash", "-s")
 	return err
 }
 
@@ -694,6 +694,8 @@ write_export() {
 }
 : >"$env_file"
 write_export AGENT "$AGENT"
+write_export LANG "${LANG:-C.UTF-8}"
+write_export LC_ALL "${LC_ALL:-C.UTF-8}"
 write_export VIBEDOCK_PERMISSION_MODE "${VIBEDOCK_PERMISSION_MODE:-manual}"
 write_export VIBEDOCK_DANGEROUS_SKIP "${VIBEDOCK_DANGEROUS_SKIP:-false}"
 write_export VIBEDOCK_ACCOUNT_ID "${VIBEDOCK_ACCOUNT_ID:-}"
@@ -723,7 +725,7 @@ chmod 600 "$env_file"
 if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
   runner="source '$env_file'; export NPM_CONFIG_PREFIX='$HOME/.local'; export PATH='$HOME/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'; /usr/local/bin/vibedock-agent-runner; exec /bin/bash -l"
   printf -v tmux_command 'bash -lc %q' "$runner"
-  tmux new-session -d -s "$tmux_name" -c /workspace "$tmux_command"
+  tmux -u new-session -d -s "$tmux_name" -c /workspace "$tmux_command"
   tmux set-option -t "$tmux_name" history-limit 100000 >/dev/null
 fi
 
@@ -740,7 +742,7 @@ nohup /usr/local/bin/ttyd \
   -c "vibe:${WORKSPACE_PASSWORD}" \
   --base-path "$base_path" \
   -t titleFixed="VibeDock Session" \
-  bash -lc "exec tmux attach-session -t '$tmux_name'" \
+  bash -lc "exec tmux -u attach-session -t '$tmux_name'" \
   >"$log_file" 2>&1 &
 echo $! >"$pid_file"
 sleep 0.15

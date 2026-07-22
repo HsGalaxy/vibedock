@@ -148,7 +148,7 @@ func TestSessionBootstrapUsesCoderLocalToolchainAndAbsoluteInfrastructureCommand
 	logPath := filepath.Join(temp, "commands.log")
 	scriptPath := filepath.Join(temp, "docker")
 	script := `#!/bin/sh
-printf '%s\n' "$*" >"$COMMAND_LOG"
+printf '%s\n' "$*" >>"$COMMAND_LOG"
 cat >/dev/null
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
@@ -156,7 +156,11 @@ cat >/dev/null
 	}
 	t.Setenv("COMMAND_LOG", logPath)
 	runtime := New(scriptPath, "vibedock")
-	if err := runtime.EnsureSession(context.Background(), "workspace-container", model.SessionRuntimeRequest{WorkspaceID: "abcdef123456", SessionID: "123456abcdef", Agent: "shell", Port: 7700, Password: "pw"}); err != nil {
+	req := model.SessionRuntimeRequest{WorkspaceID: "abcdef123456", SessionID: "123456abcdef", Agent: "shell", Port: 7700, Password: "pw"}
+	if err := runtime.EnsureSession(context.Background(), "workspace-container", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.RestartSession(context.Background(), "workspace-container", req); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := os.ReadFile(logPath)
@@ -164,13 +168,18 @@ cat >/dev/null
 		t.Fatal(err)
 	}
 	text := string(commands)
-	for _, expected := range []string{"-u coder", "HOME=/home/coder", "NPM_CONFIG_PREFIX=/home/coder/.local", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:", "workspace-container bash -s"} {
+	for _, expected := range []string{"-u coder", "HOME=/home/coder", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "NPM_CONFIG_PREFIX=/home/coder/.local", "PATH=/home/coder/.local/bin:/opt/vibedock-cli/node_modules/.bin:", "workspace-container bash -s"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q in docker exec: %s", expected, text)
 		}
 	}
+	for _, locale := range []string{"LANG=C.UTF-8", "LC_ALL=C.UTF-8"} {
+		if count := strings.Count(text, locale); count != 2 {
+			t.Fatalf("expected %q in both ensure and restart commands, got %d occurrences: %s", locale, count, text)
+		}
+	}
 	bootstrap := sessionBootstrapScript(model.SessionRuntimeRequest{WorkspaceID: "abcdef123456", SessionID: "123456abcdef", Agent: "shell", Port: 7700, Password: "pw"}, false)
-	for _, expected := range []string{"export NPM_CONFIG_PREFIX='$HOME/.local'", "export PATH='$HOME/.local/bin:/opt/vibedock-cli/node_modules/.bin:", "/usr/local/bin/vibedock-agent-runner", "/usr/local/bin/ttyd"} {
+	for _, expected := range []string{"write_export LANG \"${LANG:-C.UTF-8}\"", "write_export LC_ALL \"${LC_ALL:-C.UTF-8}\"", "tmux -u new-session", "tmux -u attach-session", "export NPM_CONFIG_PREFIX='$HOME/.local'", "export PATH='$HOME/.local/bin:/opt/vibedock-cli/node_modules/.bin:", "/usr/local/bin/vibedock-agent-runner", "/usr/local/bin/ttyd"} {
 		if !strings.Contains(bootstrap, expected) {
 			t.Fatalf("bootstrap did not pin infrastructure command %q", expected)
 		}

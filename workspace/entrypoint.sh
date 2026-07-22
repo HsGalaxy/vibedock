@@ -23,6 +23,8 @@ if ! /usr/bin/grep -Fq '# VibeDock managed shell environment' /home/coder/.bashr
   /usr/bin/printf '%s\n' \
     '' \
     '# VibeDock managed shell environment' \
+    'export LANG="${LANG:-C.UTF-8}"' \
+    'export LC_ALL="${LC_ALL:-C.UTF-8}"' \
     'export NPM_CONFIG_PREFIX="$HOME/.local"' \
     'export PATH="$HOME/.local/bin:/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
     "alias sessions='tmux list-sessions 2>/dev/null || true'" \
@@ -36,6 +38,8 @@ fi
     HOME=/home/coder \
     USER=coder \
     LOGNAME=coder \
+    LANG="${LANG:-C.UTF-8}" \
+    LC_ALL="${LC_ALL:-C.UTF-8}" \
     NPM_CONFIG_PREFIX=/home/coder/.local \
     PATH="$coder_path" \
   /usr/bin/code-server \

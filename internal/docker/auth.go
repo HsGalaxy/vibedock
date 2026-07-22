@@ -327,10 +327,11 @@ func (r *Runtime) ReadAccountConfig(ctx model.Context, accountID string, provide
 		return model.AccountConfigDocument{}, err
 	}
 	var response struct {
-		Protocol int    `json:"protocol"`
-		Path     string `json:"path"`
-		Exists   bool   `json:"exists"`
-		Content  string `json:"content"`
+		Protocol       int    `json:"protocol"`
+		Path           string `json:"path"`
+		Exists         bool   `json:"exists"`
+		Content        string `json:"content"`
+		DefaultContent string `json:"default_content"`
 	}
 	cctx, cancel := context.WithTimeout(asContext(ctx), 20*time.Second)
 	defer cancel()
@@ -343,7 +344,7 @@ func (r *Runtime) ReadAccountConfig(ctx model.Context, accountID string, provide
 	if response.Protocol != authHelperProtocol || response.Path != path {
 		return model.AccountConfigDocument{}, errors.New("configuration helper protocol incompatible")
 	}
-	return model.AccountConfigDocument{Path: response.Path, Exists: response.Exists, Content: response.Content}, nil
+	return model.AccountConfigDocument{Path: response.Path, Exists: response.Exists, Content: response.Content, DefaultContent: response.DefaultContent}, nil
 }
 
 func (r *Runtime) WriteAccountConfig(ctx model.Context, accountID string, provider model.AuthProvider, path, content string) (model.AccountConfigDocument, error) {

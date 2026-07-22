@@ -305,6 +305,27 @@ exit 1
 	}
 }
 
+func TestAccountConfigReadReturnsAnExplicitDefaultWithoutCreatingAFile(t *testing.T) {
+	script := protocolResponseScript(`
+case "$1" in
+  volume) printf '%s\n' 'vibedock-credentials'; exit 0 ;;
+esac
+case "$*" in
+  *" config-read "*) printf '%s\n' '{"protocol":1,"path":"config.toml","exists":false,"content":"","default_content":"# Optional Codex settings.\n"}'; exit 0 ;;
+esac
+exit 1
+`)
+	docker, _ := writeAuthDocker(t, script)
+	runtime := New(docker, "vibedock")
+	document, err := runtime.ReadAccountConfig(context.Background(), testAuthAccount, model.AuthProviderCodex, "config.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.Exists || document.Content != "" || document.DefaultContent != "# Optional Codex settings.\n" {
+		t.Fatalf("unexpected default config document: %#v", document)
+	}
+}
+
 func TestCredentialCleanupUsesOpaqueFixedOperations(t *testing.T) {
 	docker, logPath := writeAuthDocker(t, protocolResponseScript(`
 case "$1" in

@@ -119,6 +119,27 @@ class ValidationTest(RootCase):
             outside.rmdir()
 
     def test_config_files_are_allowlisted_and_protect_secrets(self):
+        codex_default = helper._read_config(self.root, ACCOUNT, "codex", "config.toml")
+        claude_default = helper._read_config(self.root, ACCOUNT, "claude", "settings.json")
+        self.assertFalse(codex_default["exists"])
+        self.assertEqual(codex_default["content"], "")
+        self.assertIn("Optional Codex settings", codex_default["default_content"])
+        self.assertFalse(claude_default["exists"])
+        self.assertEqual(claude_default["content"], "")
+        self.assertEqual(json.loads(claude_default["default_content"]), {})
+
+        codex_root = self.root / ACCOUNT / "codex"
+        claude_root = self.root / ACCOUNT / "claude"
+        helper._mkdir_secure(self.root, codex_root)
+        helper._mkdir_secure(self.root, claude_root)
+        (codex_root / "auth.json").write_text('{"access_token":"must-not-leak"}', encoding="utf-8")
+        (claude_root / ".credentials.json").write_text('{"oauth":"must-not-leak"}', encoding="utf-8")
+        codex_listing = helper.list_config(self.root, ACCOUNT, "codex")
+        claude_listing = helper.list_config(self.root, ACCOUNT, "claude")
+        self.assertEqual([item["path"] for item in codex_listing["files"]], ["config.toml"])
+        self.assertEqual([item["path"] for item in claude_listing["files"]], ["settings.json"])
+        self.assertNotIn("must-not-leak", json.dumps((codex_listing, claude_listing)))
+
         saved = helper._write_config(self.root, ACCOUNT, "codex", "config.toml", 'model = "gpt-test"\n')
         self.assertTrue(saved["exists"])
         with self.assertRaises(helper.HelperError):

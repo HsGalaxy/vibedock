@@ -85,6 +85,11 @@ RUN useradd --create-home --uid 1001 --shell /bin/bash coder \
     && mkdir -p /workspace /vibedock/credentials /home/coder/.config /home/coder/.local/bin /home/coder/.local/lib /home/coder/.local/share /home/coder/.vibedock/sessions \
     && chown -R coder:coder /workspace /vibedock/credentials /home/coder
 
+# Keep ttyd/tmux and terminal applications in UTF-8 mode. Without a UTF-8
+# locale tmux renders wide characters as underscores for browser clients.
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
 COPY entrypoint.sh /usr/local/bin/vibedock-entrypoint
 COPY attach-session.sh /usr/local/bin/attach-session
 COPY list-sessions.sh /usr/local/bin/list-sessions
