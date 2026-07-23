@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"vibedock/internal/controlauth"
 	"vibedock/internal/model"
 	"vibedock/internal/secrets"
 	"vibedock/internal/store"
@@ -407,11 +408,14 @@ func TestEnsureSessionSingleflightCoalescesConcurrentCalls(t *testing.T) {
 }
 
 func TestWorkspaceProxyStripsCodePrefix(t *testing.T) {
+	receivedCookies := make(chan []*http.Cookie, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCookies <- r.Cookies()
 		if r.URL.Path != "/hello" {
 			t.Fatalf("upstream path %q", r.URL.Path)
 		}
-		w.Header().Set("Set-Cookie", "session=x; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", controlauth.SessionCookieName+"=stolen; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", "session=x; Path=/; HttpOnly")
 		_, _ = w.Write([]byte("proxied"))
 	}))
 	defer upstream.Close()
@@ -425,13 +429,20 @@ func TestWorkspaceProxyStripsCodePrefix(t *testing.T) {
 	_ = st.Put(model.Workspace{ID: "abcdef123456", ContainerName: "demo", Status: "running"})
 
 	req := httptest.NewRequest(http.MethodGet, "/w/abcdef123456/code/hello", nil)
+	req.AddCookie(&http.Cookie{Name: controlauth.SessionCookieName, Value: "control-secret"})
+	req.AddCookie(&http.Cookie{Name: "session", Value: "tool-value"})
 	res := httptest.NewRecorder()
 	server.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK || res.Body.String() != "proxied" {
 		t.Fatalf("proxy status %d body %q", res.Code, res.Body.String())
 	}
-	if cookie := res.Header().Get("Set-Cookie"); !strings.Contains(cookie, "Path=/w/abcdef123456/code/") {
-		t.Fatalf("cookie path not rewritten: %q", cookie)
+	upstreamCookies := <-receivedCookies
+	if len(upstreamCookies) != 1 || upstreamCookies[0].Name != "session" || upstreamCookies[0].Value != "tool-value" {
+		t.Fatalf("code upstream received sensitive or unexpected cookies: %#v", upstreamCookies)
+	}
+	responseCookies := res.Header().Values("Set-Cookie")
+	if len(responseCookies) != 1 || strings.Contains(responseCookies[0], controlauth.SessionCookieName) || !strings.Contains(responseCookies[0], "Path=/w/abcdef123456/code/") {
+		t.Fatalf("code response cookies were not safely filtered and scoped: %q", responseCookies)
 	}
 }
 
@@ -769,13 +780,16 @@ func TestAllowWorkbenchEmbedding(t *testing.T) {
 }
 
 func TestWorkspacePreviewProxyAllowsEmbeddingAndScopesCookies(t *testing.T) {
+	receivedCookies := make(chan []*http.Cookie, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/app" {
 			t.Fatalf("upstream path %q", r.URL.Path)
 		}
+		receivedCookies <- r.Cookies()
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; img-src data:")
-		w.Header().Set("Set-Cookie", "preview=x; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", controlauth.SessionCookieName+"=stolen; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", "preview=x; Path=/; HttpOnly")
 		w.Header().Set("Location", "/next")
 		w.WriteHeader(http.StatusFound)
 	}))
@@ -790,6 +804,8 @@ func TestWorkspacePreviewProxyAllowsEmbeddingAndScopesCookies(t *testing.T) {
 	_ = st.Put(model.Workspace{ID: "abcdef123456", ContainerName: "demo", Status: "running"})
 
 	req := httptest.NewRequest(http.MethodGet, "/w/abcdef123456/port/3000/app", nil)
+	req.AddCookie(&http.Cookie{Name: controlauth.SessionCookieName, Value: "control-secret"})
+	req.AddCookie(&http.Cookie{Name: "preview", Value: "project-value"})
 	res := httptest.NewRecorder()
 	server.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusFound {
@@ -801,8 +817,13 @@ func TestWorkspacePreviewProxyAllowsEmbeddingAndScopesCookies(t *testing.T) {
 	if csp := strings.ToLower(res.Header().Get("Content-Security-Policy")); strings.Contains(csp, "frame-ancestors") || !strings.Contains(csp, "default-src") {
 		t.Fatalf("unexpected CSP after rewrite: %q", csp)
 	}
-	if cookie := res.Header().Get("Set-Cookie"); !strings.Contains(cookie, "Path=/w/abcdef123456/port/3000/") {
-		t.Fatalf("preview cookie path not scoped: %q", cookie)
+	upstreamCookies := <-receivedCookies
+	if len(upstreamCookies) != 1 || upstreamCookies[0].Name != "preview" || upstreamCookies[0].Value != "project-value" {
+		t.Fatalf("preview upstream received sensitive or unexpected cookies: %#v", upstreamCookies)
+	}
+	responseCookies := res.Header().Values("Set-Cookie")
+	if len(responseCookies) != 1 || strings.Contains(responseCookies[0], controlauth.SessionCookieName) || !strings.Contains(responseCookies[0], "Path=/w/abcdef123456/port/3000/") {
+		t.Fatalf("preview response cookies were not safely filtered and scoped: %q", responseCookies)
 	}
 	if location := res.Header().Get("Location"); location != "/w/abcdef123456/port/3000/next" {
 		t.Fatalf("preview location not rewritten: %q", location)

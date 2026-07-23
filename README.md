@@ -1,6 +1,6 @@
 # VibeDock MVP 0.5
 
-VibeDock 是一个单机、自托管的 AI 开发环境控制面。用户打开网页后，可以快速创建隔离的 Docker Workspace，导入 Git、ZIP 或本地文件，并在同一个 `8787` 工作台中使用 VS Code Web、多个 Agent Session、项目预览端口和持久化开发环境。
+VibeDock 是一个单机、自托管的 AI 开发环境控制面。用户打开网页后，可以快速创建隔离的 Docker Workspace，导入 Git、ZIP 或本地文件，并在 `8787` 控制工作台中使用 VS Code Web、多个 Agent Session 和持久化开发环境。用户项目 Preview 单独通过 `8788` Origin 提供，避免项目网页与控制 API 同源。
 
 ```text
 Workspace
@@ -35,7 +35,7 @@ Workspace 是长期开发环境；Session 是一次独立的对话或工作任�
 - 文件可以直接拖到整个工作台并导入 `/workspace`；
 - 新增命令面板，使用 `Ctrl/Cmd + K` 快速打开 Session、编辑器、Preview 与设置；
 - Workspace 启停、账号管理和环境信息退到边栏、状态栏及弹层；
-- Preview 代理会移除阻止同源工作台嵌入的 `X-Frame-Options` 和 CSP `frame-ancestors` 指令。
+- Preview 代理会移除阻止跨 Origin 工作台嵌入的 `X-Frame-Options` 和 CSP `frame-ancestors` 指令。
 
 VibeDock 不会在标签切换时主动断开已挂载工具，但浏览器后台冻结、移动系统休眠或外层反向代理的 WebSocket idle timeout 仍可能中断连接。远程部署应为 `/w/` 路径配置足够长的 WebSocket idle timeout；断线后可使用工作台 Reload 重新连接。
 
@@ -97,7 +97,7 @@ Pi Agent 和 OpenCode 不使用这里的 AccountProfile。它们的配置只属�
 
 ## 0.2 基础能力
 
-- 所有入口统一到控制面端口 `8787`；
+- 控制面、VS Code 和 Terminal 统一到 `8787`，任意项目 Preview 隔离到 `8788`；
 - `/w/{workspace}/code/` 反向代理 VS Code Web；
 - `/w/{workspace}/terminal/{session}/` 反向代理独立 Agent Session；
 - `/w/{workspace}/port/{port}/` 预览容器中的开发服务；
@@ -105,7 +105,7 @@ Pi Agent 和 OpenCode 不使用这里的 AccountProfile。它们的配置只属�
 - Session 支持创建、改名、切换 Agent/配置、重启、删除和最近输出；
 - 创建时或运行中导入 Git、ZIP 与文件；
 - Workspace 停止后项目、Home 和 Agent 状态继续保留；
-- 可选控制面 HTTP Basic Auth。
+- 首次启动管理员注册、登录会话与受保护的控制面入口。
 
 ## 快速启动
 
@@ -121,7 +121,6 @@ Pi Agent 和 OpenCode 不使用这里的 AccountProfile。它们的配置只属�
 
 ```bash
 cp .env.example .env
-# 远程部署时务必设置 VIBEDOCK_ADMIN_PASSWORD
 ./scripts/bootstrap.sh
 ```
 
@@ -131,13 +130,42 @@ cp .env.example .env
 VIBEDOCK_SKIP_PREFLIGHT=1 ./scripts/bootstrap.sh
 ```
 
-打开：
+默认只监听本机回环地址。打开：
 
 ```text
-http://服务器地址:8787
+http://127.0.0.1:8787
 ```
 
-首次启动会构建 Workspace 镜像，其中预装 VS Code Web、tmux、ttyd、Codex、Claude Code、Pi Agent 和 OpenCode。后续创建环境主要只需要启动容器、挂载卷和导入项目。
+第一次打开时必须创建管理员用户名和密码，之后才能进入控制面。密码使用 bcrypt（cost 12）哈希后保存在 `data/admin.json` 中，不会以明文写入 `.env`。登录会话使用随机 HttpOnly、SameSite=Strict Cookie；修改类 API 还要求当前会话的 CSRF Token。
+
+全新实例还会生成一个一次性初始化代码。`bootstrap.sh` 从容器内 `/data/bootstrap.token` 读取并显示它；首次注册必须同时提交该代码、管理员用户名和密码。注册成功后初始化代码失效，之后只显示普通登录页。需要手工重新查看尚未使用的代码时运行：
+
+```bash
+docker compose exec -T vibedock cat /data/bootstrap.token
+```
+
+初始化代码等同于首次管理员注册权限，不要发送到聊天、工单或公开日志中。
+
+如果 VibeDock 位于远程服务器，首次注册建议使用 SSH 隧道：
+
+```bash
+ssh -L 8787:127.0.0.1:8787 -L 8788:127.0.0.1:8788 user@server
+```
+
+然后在本机打开 `http://127.0.0.1:8787`。本地 Preview 会从 `http://127.0.0.1:8788` 加载。
+
+面向公网使用时，应保持 `VIBEDOCK_BIND_ADDRESS=127.0.0.1`，通过 HTTPS 反向代理分别暴露两个 Origin。例如，同一 hostname 可以使用 `https://vibedock.example.com`（控制面，公网 443 -> 本机 8787）和 `https://vibedock.example.com:8443`（Preview，公网 8443 -> 本机 8788），并设置：
+
+```bash
+VIBEDOCK_PREVIEW_ORIGIN=https://vibedock.example.com:8443
+VIBEDOCK_TRUST_PROXY_HEADERS=true
+```
+
+两个 Origin 必须使用同一 hostname 和 HTTPS scheme：登录 Cookie 不按端口区分，因此可以同时认证 443 与 8443；浏览器同源策略仍会因为端口不同而阻止 Preview 脚本读取控制面。VibeDock 在认证后会先剥离控制面 Cookie 再转发到 Workspace 服务，并过滤上游试图写入的同名 Cookie。不要直接把明文 HTTP 的 8787/8788 端口暴露到公网。仅当两个端口都无法被客户端绕过代理直接访问时才能信任代理头。
+
+两个反向代理入口都需要保留原始 `Host`，设置 `X-Forwarded-Proto`，用真实客户端地址覆盖 `X-Forwarded-For`，并支持 WebSocket Upgrade；不要直接透传客户端提交的转发头，否则登录限速可被伪造。Origin 校验、VS Code、Terminal 和 Preview 连接也依赖这些代理设置。建议直接代理整个站点根路径，不要在外层增加或剥离 URL 前缀。
+
+首次启动会构建 Workspace 镜像，其中预装 VS Code Web、tmux、ttyd、Codex、Claude Code、Pi Agent 和 OpenCode。后续创建环境主要只需要启动容器、挂载卷和导入项目。启动脚本会等待 `/healthz` 就绪；启动失败时会显示最近的控制面日志，而不是提前报告成功。
 
 ## Agent 认证模型
 
@@ -335,18 +363,25 @@ Browser
 
 Secret 不会作为 `docker exec -e TOKEN=...` 参数传入。Session 停止或重启时，其 `/dev/shm` 临时环境文件会被删除；容器停止后 tmpfs 内容也会消失。
 
-## 统一工作台
+## 工作台入口与 Preview 隔离
 
-所有用户入口位于同一 Origin：
+控制面、VS Code 与 Terminal 位于控制 Origin：
 
 ```text
 http://服务器:8787/workspace/<workspace-id>
 http://服务器:8787/w/<workspace-id>/code/
 http://服务器:8787/w/<workspace-id>/terminal/<session-id>/
-http://服务器:8787/w/<workspace-id>/port/<port>/
 ```
 
-Workspace 服务不发布随机宿主机端口。控制面和 Workspace 加入专用 Docker 网络，由 Go 反向代理 HTTP 与 WebSocket。
+任意项目网页只通过独立 Preview Origin 加载：
+
+```text
+http://服务器:8788/w/<workspace-id>/port/<port>/
+```
+
+控制端口会拒绝 `/w/<workspace>/port/...`，Preview 端口也会拒绝 API、VS Code 与 Terminal 路径。两者共享同一个服务端登录 Session；Cookie 会跨同 hostname 的端口发送，但浏览器 SOP 会隔离不同端口的网页脚本。因此，即使项目依赖或开发服务器返回恶意脚本，它也不能以同源脚本权限读取控制页面或 API 响应；修改 API 还需要匹配 Origin 与 CSRF Token。
+
+Workspace 服务不发布随机宿主机端口。控制面、Preview 代理和 Workspace 加入专用 Docker 网络，由 Go 反向代理 HTTP 与 WebSocket。
 
 ## 创建环境
 
@@ -389,7 +424,7 @@ http://服务器:8787/w/<workspace-id>/code/?folder=/workspace
 Preview：
 
 ```text
-http://服务器:8787/w/<workspace-id>/port/3000/
+http://服务器:8788/w/<workspace-id>/port/3000/
 ```
 
 应用需要监听 `0.0.0.0:<port>`。部分只支持根路径或绝对静态资源 URL 的应用可能不适合子路径代理。
@@ -471,22 +506,37 @@ docker compose up -d --build
 `.env`：
 
 ```bash
+VIBEDOCK_BIND_ADDRESS=127.0.0.1
 VIBEDOCK_PORT=8787
+VIBEDOCK_PREVIEW_PORT=8788
+VIBEDOCK_PREVIEW_ORIGIN=
 VIBEDOCK_DOCKER_NETWORK=vibedock
-VIBEDOCK_ADMIN_USER=vibe
-VIBEDOCK_ADMIN_PASSWORD=change-this-password
+VIBEDOCK_SESSION_TTL=12h
+VIBEDOCK_TRUST_PROXY_HEADERS=false
 VIBEDOCK_CREDENTIAL_KEY=
 VIBEDOCK_AUTH_HELPER_IMAGE=vibedock/workspace:local
 VIBEDOCK_LOGIN_TTL=15m
 VIBEDOCK_MAX_LOGIN_HELPERS=3
 ```
 
-`VIBEDOCK_ADMIN_PASSWORD` 为空时不启用控制面认证，只应在本机或可信私网中使用。
+`VIBEDOCK_BIND_ADDRESS` 默认是 `127.0.0.1`。只有在已经完成管理员注册，并且外层网络确实提供 HTTPS、访问控制或可信 VPN 保护时，才应将它改成其他地址。`bootstrap.sh` 会拒绝在 `data/admin.json` 尚不存在时绑定非回环地址，避免他人抢先注册管理员。管理员凭据通过首次启动页面创建，不再使用 `.env` 中的明文用户名或密码。
+
+`VIBEDOCK_TRUST_PROXY_HEADERS` 默认为 `false`。启用后，VibeDock 使用 `X-Forwarded-Proto` 判断是否设置 Secure Cookie，并使用第一个有效的 `X-Forwarded-For` 地址进行登录限速。它不是通用的公网开关，只应在防火墙确保所有请求都来自可信反向代理时使用。
+
+`VIBEDOCK_PREVIEW_PORT` 是宿主机上的隔离 Preview 端口，必须与 `VIBEDOCK_PORT` 不同。默认情况下浏览器使用当前控制面 scheme/hostname 加该端口构造 Preview Origin。HTTPS 反代使用其他公网端口时，应通过 `VIBEDOCK_PREVIEW_ORIGIN` 提供相同 hostname、相同 scheme 和不同端口的完整 `http(s)://host:port` Origin；该值不能包含路径、查询参数、用户信息或 fragment。
+
+除登录页静态资源、认证初始化接口和最小存活探针外，`/api/...`、VS Code、Terminal 与 Workspace Preview 的 `/w/...` 入口都要求有效管理员会话。修改类 API 同时执行 Origin 和 CSRF 校验；登录失败按客户端地址限速。
 
 ## API
 
 ```text
+GET    /healthz
+GET    /api/auth/status
+POST   /api/auth/register
+POST   /api/auth/login
+POST   /api/auth/logout
 GET    /api/health
+GET    /api/runtime-config
 GET    /api/templates
 GET    /api/environment-profiles
 POST   /api/environment-profiles
@@ -587,15 +637,18 @@ make test
 - 同一 Workspace 内的 Shell、IDE 与 Agent 以相同 Unix 用户运行，技术上可读取正在运行 Session 的 `/dev/shm` 凭据文件；
 - Pi/OpenCode 的加密 Secret 归 Session 所有，但运行时仍会进入该 Workspace 的进程环境；
 - 尚未实现用户 ACL、Secret scope、审计、配额、网络策略、镜像签名和恶意上传扫描；
-- Basic Auth 必须配合 HTTPS，不能保护明文 HTTP 链路上的密钥输入。
+- 管理员登录只能保护 VibeDock 的应用入口；HTTPS 仍然是远程传输用户名、密码、Token 和终端内容所必需的；
+- 任意项目 Preview 已与控制面拆分到不同端口 Origin；控制端口不再代理 Preview，Preview 端口也不暴露控制 API；
+- VS Code 和 Terminal 仍是控制 Origin 下的受信任工具；已控制 Workspace `coder` 用户的恶意进程可以替换这些服务，因此管理员登录并不能把恶意仓库执行变成安全沙箱；
+- `/healthz` 是供容器编排使用的公开存活探针，只返回最小状态，不包含 Workspace、账号或配置数据。
 
 远程部署至少应：
 
-1. 设置强 `VIBEDOCK_ADMIN_PASSWORD`；
-2. 在外层配置 HTTPS；
-3. 备份并限制 `data/credential.key` 权限；
-4. 仅允许可信用户访问；
-5. 不向其他容器暴露 Docker socket。
+1. 先通过本机或 SSH 隧道完成管理员注册，并使用唯一的强密码；
+2. 保持 8787/8788 绑定到 `127.0.0.1`，为同一 hostname 的两个不同 Origin 配置 HTTPS 反向代理；
+3. 防火墙只开放两个 HTTPS 入口，不直接开放 8787/8788；
+4. 备份并限制 `data/admin.json` 和 `data/credential.key` 的权限；
+5. 仅允许可信用户访问，不向其他容器暴露 Docker socket。
 
 ## 已验证
 

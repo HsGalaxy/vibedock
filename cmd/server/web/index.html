@@ -19,7 +19,51 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <section id="dashboardView" class="dashboard-view">
+  <section id="authView" class="auth-view" aria-labelledby="authTitle">
+    <header class="auth-header shell-width">
+      <div class="auth-brand" aria-label="VibeDock">
+        <span class="logo">VD</span>
+        <span class="brand-copy"><strong>VibeDock</strong><small>Workspace control plane</small></span>
+      </div>
+      <button class="icon-button" data-theme-toggle title="切换明暗主题" aria-label="切换明暗主题">☼</button>
+    </header>
+    <main class="auth-main shell-width">
+      <section class="auth-intro">
+        <div class="eyebrow">PRIVATE CONTROL PLANE</div>
+        <h1 id="authTitle">正在检查访问状态</h1>
+        <p id="authDescription">正在连接当前 VibeDock 实例。</p>
+        <dl class="auth-scope-list" aria-label="受保护的服务">
+          <div><dt>Workspace 管理</dt><dd>创建、启动与删除环境</dd></div>
+          <div><dt>开发工具</dt><dd>VS Code、终端与应用预览</dd></div>
+          <div><dt>Agent 凭据</dt><dd>账号配置与官方登录流程</dd></div>
+        </dl>
+      </section>
+      <section class="auth-form-panel" aria-live="polite">
+        <div id="authLoading" class="auth-loading" role="status">
+          <span class="auth-loading-mark">VD</span>
+          <strong id="authLoadingTitle">连接控制面</strong>
+          <small id="authLoadingDescription">正在确认此实例的认证状态…</small>
+          <button id="authRetry" class="button ghost small hidden" type="button">重新连接</button>
+        </div>
+        <form id="authForm" class="auth-form hidden">
+          <div class="auth-form-heading">
+            <span id="authModeLabel" class="eyebrow">ADMIN ACCESS</span>
+            <h2 id="authFormTitle">登录 VibeDock</h2>
+            <p id="authFormDescription">输入此实例的管理员账号。</p>
+          </div>
+          <label class="field"><span>用户名</span><input id="authUsername" name="username" type="text" minlength="3" maxlength="64" autocomplete="username" autocapitalize="none" spellcheck="false" required /></label>
+          <label class="field"><span>密码</span><input id="authPassword" name="password" type="password" autocomplete="current-password" required /></label>
+          <label id="authConfirmField" class="field hidden"><span>确认密码</span><input id="authPasswordConfirm" name="password_confirm" type="password" minlength="12" autocomplete="new-password" /></label>
+          <label id="authSetupField" class="field hidden"><span>初始化代码</span><input id="authSetupToken" name="setup_token" type="password" maxlength="256" autocomplete="one-time-code" /><small>使用首次启动时生成的一次性代码。</small></label>
+          <div id="authError" class="error-box hidden" role="alert"></div>
+          <button id="authSubmit" class="button primary large auth-submit" type="submit">登录</button>
+          <p id="authFormNote" class="auth-form-note">认证只对当前 VibeDock 实例生效。</p>
+        </form>
+      </section>
+    </main>
+  </section>
+
+  <section id="dashboardView" class="dashboard-view hidden">
     <header class="dashboard-header shell-width">
       <button class="brand-button" data-home aria-label="回到 Workspace 列表">
         <span class="logo">VD</span>
@@ -31,6 +75,8 @@
         <button id="openEnvironmentProfiles" class="button ghost">定制环境</button>
         <button id="openAccounts" class="button ghost">账号与 Provider</button>
         <button id="refreshButton" class="icon-button" title="刷新 Workspace 列表" aria-label="刷新 Workspace 列表">↻</button>
+        <span id="dashboardUsername" class="signed-in-user"></span>
+        <button id="logoutButton" class="button subtle small" type="button">退出</button>
       </div>
     </header>
 
@@ -119,6 +165,7 @@
         <button class="icon-button compact" data-theme-toggle title="切换明暗主题" aria-label="切换明暗主题">☼</button>
         <button id="workspacePowerButton" class="icon-button compact" title="启动或停止环境">◉</button>
         <button id="workspaceSettingsButton" class="icon-button compact" title="Workspace 设置">⚙</button>
+        <button id="workspaceLogoutButton" class="button subtle small" type="button">退出</button>
       </div>
     </header>
 
@@ -359,7 +406,7 @@
 
   <dialog id="previewDialog" class="modal small-modal">
     <form id="previewForm">
-      <div class="dialog-header"><div><div class="eyebrow">PORT PREVIEW</div><h3>打开开发服务</h3><p>通过 8787 反向代理容器内端口。</p></div><button type="button" class="icon-button" data-close="previewDialog">×</button></div>
+      <div class="dialog-header"><div><div class="eyebrow">PORT PREVIEW</div><h3>打开开发服务</h3><p>通过独立 Preview 服务打开容器内端口。</p></div><button type="button" class="icon-button" data-close="previewDialog">×</button></div>
       <label class="field"><span>容器端口</span><input id="previewPortInput" type="number" min="1" max="65535" value="3000" required /></label>
       <div class="dialog-actions"><button type="button" class="button subtle" data-close="previewDialog">取消</button><button type="submit" class="button primary">在工作台打开</button></div>
     </form>
@@ -493,6 +540,7 @@
   </dialog>
   <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
   <script src="/account-auth.js" defer></script>
+  <script src="/control-auth.js" defer></script>
   <script src="/terminal-clipboard.js" defer></script>
   <script src="/app.js" defer></script>
 </body>

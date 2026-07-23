@@ -4,14 +4,26 @@ services:
     container_name: vibedock
     restart: unless-stopped
     ports:
-      - "${VIBEDOCK_PORT:-8787}:8787"
+      - target: 8787
+        published: "${VIBEDOCK_PORT:-8787}"
+        host_ip: "${VIBEDOCK_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+      - target: 8788
+        published: "${VIBEDOCK_PREVIEW_PORT:-8788}"
+        host_ip: "${VIBEDOCK_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
     environment:
       VIBEDOCK_LISTEN: ":8787"
+      VIBEDOCK_PREVIEW_LISTEN: ":8788"
+      VIBEDOCK_PREVIEW_ORIGIN: "${VIBEDOCK_PREVIEW_ORIGIN:-}"
+      VIBEDOCK_PREVIEW_PUBLIC_PORT: "${VIBEDOCK_PREVIEW_PUBLIC_PORT:-${VIBEDOCK_PREVIEW_PORT:-8788}}"
       VIBEDOCK_STATE: "/data/workspaces.json"
       VIBEDOCK_TEMPLATES: "/config/templates.json"
       VIBEDOCK_DOCKER_NETWORK: "${VIBEDOCK_DOCKER_NETWORK:-vibedock}"
-      VIBEDOCK_ADMIN_USER: "${VIBEDOCK_ADMIN_USER:-vibe}"
-      VIBEDOCK_ADMIN_PASSWORD: "${VIBEDOCK_ADMIN_PASSWORD:-}"
+      VIBEDOCK_AUTH_FILE: "${VIBEDOCK_AUTH_FILE:-/data/admin.json}"
+      VIBEDOCK_BOOTSTRAP_TOKEN_FILE: "${VIBEDOCK_BOOTSTRAP_TOKEN_FILE:-/data/bootstrap.token}"
+      VIBEDOCK_SESSION_TTL: "${VIBEDOCK_SESSION_TTL:-12h}"
+      VIBEDOCK_TRUST_PROXY_HEADERS: "${VIBEDOCK_TRUST_PROXY_HEADERS:-false}"
       VIBEDOCK_CREDENTIAL_KEY_FILE: "/data/credential.key"
       VIBEDOCK_CREDENTIAL_KEY: "${VIBEDOCK_CREDENTIAL_KEY:-}"
       VIBEDOCK_AUTH_HELPER_IMAGE: "${VIBEDOCK_AUTH_HELPER_IMAGE:-vibedock/workspace:local}"
@@ -21,6 +33,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/data
       - ./config:/config:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8787/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
     networks:
       - vibedock
 

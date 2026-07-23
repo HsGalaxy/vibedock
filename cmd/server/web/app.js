@@ -11,6 +11,8 @@ const state = {
   pendingWorkspaceIDs: new Set(),
   batchBusy: false,
   controlAuthEnabled: true,
+  controlAuth: {initialized:false, authenticated:false, username:'', csrfToken:''},
+  previewOrigin: (() => { const current = new URL(location.href); const preview = new URL(location.href); preview.port = '8788'; return preview.origin === current.origin ? '' : preview.origin; })(),
   accountAuth: new Map(),
   activeAuth: null,
   currentWorkspace: null,
@@ -49,7 +51,9 @@ const environmentProfilesDialog = $('#environmentProfilesDialog');
 const codexLoginDialog = $('#codexLoginDialog');
 const claudeLoginDialog = $('#claudeLoginDialog');
 const accountAuth = globalThis.VibeDockAccountAuth;
+const controlAuth = globalThis.VibeDockControlAuth;
 const AUTH_REQUEST_HEADER = 'X-VibeDock-Request';
+const CSRF_HEADER = 'X-VibeDock-CSRF';
 
 function applyTheme(theme, persist = true) {
   const value = theme === 'light' ? 'light' : 'dark';
@@ -72,13 +76,24 @@ function toggleTheme() {
 async function api(path, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeout ?? 30000);
+  const method = String(options.method || 'GET').toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!controlAuth.isReadMethod(method)) headers.set(CSRF_HEADER, state.controlAuth.csrfToken);
+  const {timeout: _timeout, handleUnauthorized = true, ...requestOptions} = options;
   try {
-    const response = await fetch(path, {...options, signal: options.signal || controller.signal});
+    const response = await fetch(path, {
+      ...requestOptions,
+      method,
+      headers,
+      credentials:'same-origin',
+      signal:options.signal || controller.signal,
+    });
     if (response.status === 204) return null;
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(body.detail ? `${body.error}: ${body.detail}` : body.error || `HTTP ${response.status}`);
       error.status = response.status;
+      if (response.status === 401 && handleUnauthorized) void recoverAuthentication();
       throw error;
     }
     return body;
@@ -99,6 +114,180 @@ function showToast(message) {
   toast.classList.remove('hidden');
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.add('hidden'), 2800);
+}
+
+let applicationRefreshTimer = 0;
+let applicationActive = false;
+let authRecoveryPromise = null;
+
+function setControlAuthStatus(payload) {
+  state.controlAuth = controlAuth.normalizeStatus(payload);
+  $('#dashboardUsername').textContent = state.controlAuth.username;
+  return state.controlAuth;
+}
+
+function stopApplication() {
+  applicationActive = false;
+  clearInterval(applicationRefreshTimer);
+  applicationRefreshTimer = 0;
+  clearTimeout(authPollTimer);
+  clearInterval(authCountdownTimer);
+  authPollTimer = 0;
+  authCountdownTimer = 0;
+  state.activeAuth = null;
+  destroyAllViews();
+  state.templates = [];
+  state.environmentProfiles = [];
+  state.workspaces = [];
+  state.accounts = [];
+  state.accountAuth.clear();
+  state.currentWorkspace = null;
+  state.resourceStats = null;
+  state.resourceStatsWorkspaceID = null;
+  state.tabs = [];
+  state.panes = {primary:null, secondary:null};
+  for (const id of ['workspaceGrid','recentSessionList','sessionList','accountList']) {
+    const element = $(`#${id}`);
+    if (element) element.replaceChildren();
+  }
+  for (const dialog of $$('dialog[open]')) dialog.close();
+}
+
+function showAuthentication(payload, {focus = true} = {}) {
+  const status = setControlAuthStatus(payload);
+  stopApplication();
+  $('#dashboardView').classList.add('hidden');
+  $('#workspaceView').classList.add('hidden');
+  $('#authView').classList.remove('hidden');
+  $('#authLoading').classList.add('hidden');
+  $('#authForm').classList.remove('hidden');
+  document.body.style.overflow = '';
+  document.title = status.initialized ? '登录 · VibeDock' : '初始化 · VibeDock';
+
+  const registering = controlAuth.modeFor(status) === 'register';
+  $('#authTitle').textContent = registering ? '保护这个 VibeDock 实例' : '欢迎回到 VibeDock';
+  $('#authDescription').textContent = registering
+    ? '创建管理员账号后，Workspace、开发工具和 Agent 凭据都会要求登录才能访问。'
+    : '使用此实例的管理员账号继续管理 Workspace。';
+  $('#authModeLabel').textContent = registering ? 'FIRST-RUN SETUP' : 'ADMIN ACCESS';
+  $('#authFormTitle').textContent = registering ? '创建管理员账号' : '登录 VibeDock';
+  $('#authFormDescription').textContent = registering
+    ? '这是此实例唯一的控制面管理员。请使用不与其他服务重复的密码。'
+    : '输入此实例的管理员用户名和密码。';
+  $('#authConfirmField').classList.toggle('hidden', !registering);
+  $('#authSetupField').classList.toggle('hidden', !registering);
+  $('#authPasswordConfirm').required = registering;
+  $('#authSetupToken').required = registering;
+  $('#authPassword').minLength = registering ? 12 : 1;
+  $('#authPassword').autocomplete = registering ? 'new-password' : 'current-password';
+  $('#authSubmit').textContent = registering ? '创建账号并进入' : '登录';
+  $('#authFormNote').textContent = registering
+    ? '密码至少 12 个字符，创建后即可进入控制面。'
+    : '认证会话仅保存在当前浏览器中。';
+  $('#authError').textContent = '';
+  $('#authError').classList.add('hidden');
+  $('#authPassword').value = '';
+  $('#authPasswordConfirm').value = '';
+  $('#authSetupToken').value = '';
+  if (focus) setTimeout(() => $('#authUsername').focus(), 0);
+}
+
+function showAuthenticationUnavailable(error) {
+  $('#authSetupToken').value = '';
+  stopApplication();
+  $('#dashboardView').classList.add('hidden');
+  $('#workspaceView').classList.add('hidden');
+  $('#authView').classList.remove('hidden');
+  $('#authForm').classList.add('hidden');
+  $('#authLoading').classList.remove('hidden');
+  $('#authLoadingTitle').textContent = '无法连接控制面';
+  $('#authLoadingDescription').textContent = error?.message || '请检查服务状态后重试。';
+  $('#authRetry').classList.remove('hidden');
+  $('#authTitle').textContent = 'VibeDock 暂时不可用';
+  $('#authDescription').textContent = '浏览器无法确认此实例的认证状态。';
+  document.title = '连接失败 · VibeDock';
+}
+
+async function recoverAuthentication() {
+  if (authRecoveryPromise) return authRecoveryPromise;
+  showAuthentication({initialized:true, authenticated:false}, {focus:false});
+  authRecoveryPromise = (async () => {
+    try {
+      const status = await api('/api/auth/status', {handleUnauthorized:false, timeout:10000});
+      if (!status.authenticated) showAuthentication(status);
+    } catch (_) {
+      showAuthentication({initialized:true, authenticated:false});
+    } finally {
+      authRecoveryPromise = null;
+    }
+  })();
+  return authRecoveryPromise;
+}
+
+async function submitControlAuth(event) {
+  event.preventDefault();
+  const mode = controlAuth.modeFor(state.controlAuth);
+  if (mode === 'application') return;
+  const username = $('#authUsername').value.trim();
+  const password = $('#authPassword').value;
+  const confirmation = $('#authPasswordConfirm').value;
+  const setupToken = mode === 'register' ? $('#authSetupToken').value.trim() : '';
+  const validationError = controlAuth.validateCredentials(mode, username, password, confirmation, setupToken);
+  const errorBox = $('#authError');
+  if (validationError) {
+    errorBox.textContent = validationError;
+    errorBox.classList.remove('hidden');
+    return;
+  }
+
+  const submit = $('#authSubmit');
+  submit.disabled = true;
+  submit.textContent = mode === 'register' ? '正在创建账号…' : '正在登录…';
+  errorBox.classList.add('hidden');
+  try {
+    const status = await api(`/api/auth/${mode}`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(mode === 'register' ? {username, password, setup_token:setupToken} : {username, password}),
+      handleUnauthorized:false,
+    });
+    const normalized = setControlAuthStatus(status);
+    if (!normalized.authenticated) throw new Error('认证未完成，请重试');
+    $('#authSetupToken').value = '';
+    $('#authView').classList.add('hidden');
+    await startApplication();
+  } catch (error) {
+    if (mode === 'register' && error.status === 409) {
+      try {
+        const status = await api('/api/auth/status', {handleUnauthorized:false});
+        showAuthentication(status, {focus:false});
+        $('#authUsername').value = username;
+        $('#authError').textContent = '此实例已经完成初始化，请登录。';
+        $('#authError').classList.remove('hidden');
+        $('#authPassword').focus();
+        return;
+      } catch (_) { /* show the original registration error below */ }
+    }
+    errorBox.textContent = error.message;
+    errorBox.classList.remove('hidden');
+    $('#authPassword').select();
+  } finally {
+    submit.disabled = false;
+    submit.textContent = controlAuth.modeFor(state.controlAuth) === 'register' ? '创建账号并进入' : '登录';
+  }
+}
+
+async function logoutControlPlane() {
+  const buttons = [$('#logoutButton'), $('#workspaceLogoutButton')];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const status = await api('/api/auth/logout', {method:'POST'});
+    showAuthentication(status || {initialized:true, authenticated:false});
+  } catch (error) {
+    if (error.status !== 401) showToast(error.message);
+  } finally {
+    buttons.forEach(button => { button.disabled = false; });
+  }
 }
 
 function statusLabel(status) {
@@ -581,8 +770,9 @@ function tabDescriptor(id) {
   }
   if (id.startsWith('port:')) {
     const port = Number(id.slice(5));
-    if (!Number.isInteger(port)) return null;
-    return {id, kind:'port', payload:port, title:`Preview :${port}`, icon:'◎', url:`/w/${ws.id}/port/${port}/`};
+    if (!Number.isInteger(port) || !state.previewOrigin) return null;
+    const url = new URL(`/w/${ws.id}/port/${port}/`, `${state.previewOrigin}/`).href;
+    return {id, kind:'port', payload:port, title:`Preview :${port}`, icon:'◎', url};
   }
   return null;
 }
@@ -625,6 +815,7 @@ function activeTab(pane = state.focusedPane) { return state.tabs.find(tab => tab
 
 function openTab(kind, payload = null, options = {}) {
   if (!state.currentWorkspace) return;
+  if (kind === 'port' && !state.previewOrigin) return showToast('Preview 服务未配置，已阻止在控制面 Origin 中打开。');
   let pane = options.pane || state.focusedPane;
   const id = kind === 'session' ? `session:${payload}` : kind === 'port' ? `port:${payload}` : kind;
   const tab = ensureTab(id);
@@ -984,7 +1175,9 @@ async function refreshAll({quiet = false} = {}) {
   refreshPromise = (async () => {
   $('#refreshButton').disabled = true;
   try {
-    [state.templates, state.environmentProfiles, state.workspaces, state.accounts] = await Promise.all([api('/api/templates'), api('/api/environment-profiles'), api('/api/workspaces'), api('/api/accounts')]);
+    const [templates, environmentProfiles, workspaces, accounts] = await Promise.all([api('/api/templates'), api('/api/environment-profiles'), api('/api/workspaces'), api('/api/accounts')]);
+    if (!state.controlAuth.authenticated) return;
+    [state.templates, state.environmentProfiles, state.workspaces, state.accounts] = [templates, environmentProfiles, workspaces, accounts];
     renderTemplates();
     if (environmentProfilesDialog.open) {
       const currentProfile = $('#environmentEditingID').value;
@@ -2205,7 +2398,11 @@ window.addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.key === '\\') { event.preventDefault(); if (state.currentWorkspace) toggleSplit(); }
   if (event.key === 'Escape' && $('#workspaceView').classList.contains('immersive')) toggleImmersive();
 });
-window.addEventListener('popstate', () => { const id = workspaceRouteID(); if (id) openWorkspace(id, false); else showDashboard(false); });
+window.addEventListener('popstate', () => {
+  if (!state.controlAuth.authenticated) return;
+  const id = workspaceRouteID();
+  if (id) openWorkspace(id, false); else showDashboard(false);
+});
 window.addEventListener('resize', () => {
   if (!state.currentWorkspace) return;
   $('#paneDivider').setAttribute('aria-orientation', window.innerWidth <= 720 ? 'horizontal' : 'vertical');
@@ -2214,13 +2411,15 @@ window.addEventListener('resize', () => {
 
 /* Workbench-wide drag import */
 document.addEventListener('dragenter', event => {
+  if (!state.controlAuth.authenticated) return;
   if (!event.dataTransfer?.types?.includes('Files')) return;
   event.preventDefault(); state.dragDepth++;
   if (state.currentWorkspace) $('#dropOverlay').classList.remove('hidden');
 });
-document.addEventListener('dragover', event => { if (event.dataTransfer?.types?.includes('Files')) event.preventDefault(); });
+document.addEventListener('dragover', event => { if (state.controlAuth.authenticated && event.dataTransfer?.types?.includes('Files')) event.preventDefault(); });
 document.addEventListener('dragleave', event => { if (!event.dataTransfer?.types?.includes('Files')) return; state.dragDepth = Math.max(0, state.dragDepth - 1); if (!state.dragDepth) $('#dropOverlay').classList.add('hidden'); });
 document.addEventListener('drop', event => {
+  if (!state.controlAuth.authenticated) return;
   if (event.target.closest?.('.dropzone')) return;
   if (!event.dataTransfer?.files?.length) return;
   event.preventDefault(); state.dragDepth = 0; $('#dropOverlay').classList.add('hidden');
@@ -2230,9 +2429,19 @@ document.addEventListener('drop', event => {
 bindDropzone($('#dropzone'), $('#fileInput'), $('#fileHint'));
 bindDropzone($('#uploadDialog .dropzone'), $('#workspaceFileInput'), $('#workspaceFileHint'));
 
-async function boot() {
-  applyTheme(document.documentElement.dataset.theme, false);
+async function startApplication() {
+  if (!state.controlAuth.authenticated || applicationActive) return;
+  applicationActive = true;
+  $('#authView').classList.add('hidden');
   ensureCommandDialog();
+  try {
+    const runtimeConfig = await api('/api/runtime-config');
+    state.previewOrigin = controlAuth.resolvePreviewOrigin(location.href, runtimeConfig);
+  } catch (error) {
+    if (!state.controlAuth.authenticated) return;
+    state.previewOrigin = '';
+    showToast('Preview 配置不可用，已禁用应用预览。');
+  }
   const healthBadge = $('#healthBadge');
   try {
     const health = await api('/api/health');
@@ -2248,17 +2457,42 @@ async function boot() {
     healthBadge.title = '无法连接 Control plane';
   }
   await refreshAll({quiet:false});
+  if (!applicationActive || !state.controlAuth.authenticated) return;
   const id = workspaceRouteID();
   if (id) await openWorkspace(id, false); else showDashboard(false);
-  setInterval(() => { if (!document.hidden) refreshAll({quiet:true}); }, 15000);
+  clearInterval(applicationRefreshTimer);
+  applicationRefreshTimer = setInterval(() => {
+    if (!document.hidden && state.controlAuth.authenticated) refreshAll({quiet:true});
+  }, 15000);
+}
+
+async function boot() {
+  applyTheme(document.documentElement.dataset.theme, false);
+  $('#authRetry').classList.add('hidden');
+  $('#authLoadingTitle').textContent = '连接控制面';
+  $('#authLoadingDescription').textContent = '正在确认此实例的认证状态…';
+  try {
+    const status = await api('/api/auth/status', {handleUnauthorized:false, timeout:10000});
+    const normalized = setControlAuthStatus(status);
+    if (normalized.authenticated) await startApplication();
+    else showAuthentication(status);
+  } catch (error) {
+    showAuthenticationUnavailable(error);
+  }
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     clearTimeout(authPollTimer);
     return;
   }
+  if (!state.controlAuth.authenticated) return;
   refreshAll({quiet:true});
   if (state.activeAuth && currentAuthDialog()?.open && accountAuth.isActiveAttempt(state.activeAuth.attempt?.state)) void pollActiveAuthAttempt();
 });
+
+$('#authForm').addEventListener('submit', submitControlAuth);
+$('#authRetry').onclick = () => void boot();
+$('#logoutButton').onclick = () => void logoutControlPlane();
+$('#workspaceLogoutButton').onclick = () => void logoutControlPlane();
 
 boot();

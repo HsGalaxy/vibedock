@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"vibedock/internal/controlauth"
 	"vibedock/internal/model"
 	"vibedock/internal/secrets"
 	"vibedock/internal/store"
@@ -985,8 +986,10 @@ func (s *Server) handleWorkspaceProxy(w http.ResponseWriter, r *http.Request) {
 			token := base64.StdEncoding.EncodeToString([]byte("vibe:" + ws.Password))
 			req.Header.Set("Authorization", "Basic "+token)
 		}
+		stripRequestCookie(req, controlauth.SessionCookieName)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		filterResponseCookie(resp.Header, controlauth.SessionCookieName)
 		// Workspace tools are intentionally rendered inside the same-origin
 		// VibeDock workbench. Development servers frequently send DENY or a
 		// restrictive frame-ancestors directive by default, so preview responses
@@ -1015,6 +1018,27 @@ func (s *Server) handleWorkspaceProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(rw, http.StatusBadGateway, "Workspace 服务连接失败", proxyErr)
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func stripRequestCookie(r *http.Request, blockedName string) {
+	cookies := r.Cookies()
+	r.Header.Del("Cookie")
+	for _, cookie := range cookies {
+		if cookie.Name != blockedName {
+			r.AddCookie(cookie)
+		}
+	}
+}
+
+func filterResponseCookie(header http.Header, blockedName string) {
+	values := header.Values("Set-Cookie")
+	header.Del("Set-Cookie")
+	for _, value := range values {
+		cookie, err := http.ParseSetCookie(value)
+		if err == nil && cookie.Name != blockedName {
+			header.Add("Set-Cookie", value)
+		}
+	}
 }
 
 func (s *Server) refreshWorkspace(ctx context.Context, ws model.Workspace, ensure bool) model.Workspace {

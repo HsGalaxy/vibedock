@@ -26,15 +26,18 @@ port:<container-port>
 
 每个 Pane 独立选择一个标签。布局状态保存在浏览器 `localStorage`，后端仍只维护 Workspace、Session 和账号事实状态。每个 Workspace + 标签 ID 对应一个稳定 iframe，统一挂载在 `pane-view-layer`；Pane 只提供几何位置，切换标签或交换分屏时通过 CSS 坐标和可见性复用 browsing context，不在两个 Pane DOM 之间 reparent iframe。最多保留 8 个 View，隐藏 View 超限时按 LRU 卸载。
 
-iframe 通过现有同源代理加载：
+iframe 通过两个受控代理入口加载：
 
 ```text
-/w/<workspace>/code/
-/w/<workspace>/terminal/<session>/
-/w/<workspace>/port/<port>/
+Control Origin (:8787)
+├─ /w/<workspace>/code/
+└─ /w/<workspace>/terminal/<session>/
+
+Preview Origin (:8788)
+└─ /w/<workspace>/port/<port>/
 ```
 
-Preview 响应在代理边界移除 `X-Frame-Options`，并只删除 CSP 中的 `frame-ancestors` 指令，使用户自己运行的开发服务可以嵌入同源工作台；其余 CSP 指令保持不变。
+Preview 响应在代理边界移除 `X-Frame-Options`，并只删除 CSP 中的 `frame-ancestors` 指令，使用户自己运行的开发服务可以跨 Origin 嵌入工作台；其余 CSP 指令保持不变。浏览器可以显示 iframe，但不同端口的 SOP 阻止 Preview 脚本访问父工作台 DOM 或读取控制 API 响应。
 
 ## 产品对象
 
@@ -74,6 +77,10 @@ Workspace 是长期开发环境；Session 是一次对话或工作任务。
 
 ```text
 cmd/server
+internal/controlauth
+  ├─ 首次初始化代码与 bcrypt 管理员凭据
+  ├─ 登录 Session、Cookie 与 CSRF
+  └─ 登录限速和安全响应头
 internal/app
   ├─ HTTP API
   ├─ Workspace / Session 编排
@@ -86,6 +93,23 @@ internal/docker    Docker Runtime、凭据注入、代理目标发现
 internal/secrets   AES-GCM master key / encrypt / decrypt
 internal/store     JSON 持久化与迁移
 ```
+
+`cmd/server` 同时启动两个 HTTP listener。控制 listener 提供静态工作台、认证、API、VS Code 和 Terminal；Preview listener 只接受 `/w/<workspace>/port/...`。任一 listener 启动或运行失败都会触发两者同步关闭，避免只剩下一个权限边界不完整的入口。
+
+## 控制面认证
+
+全新实例没有默认管理员密码。`internal/controlauth` 在 `/data/bootstrap.token` 创建权限为 `0600` 的一次性初始化代码，首次注册必须同时提交该代码、用户名和密码。管理员文件 `/data/admin.json` 只保存用户名、bcrypt hash 和创建时间；注册成功后初始化代码失效。
+
+认证边界：
+
+- `/healthz`、登录页静态资源和必要的认证 bootstrap API 可以匿名访问；
+- 其他 `/api/...` 与控制端口 `/w/...` 需要服务端 Session；
+- Preview listener 复用相同的 Session Manager，但只开放 Preview 路径；
+- 修改 API 同时校验 Cookie Session、Origin 和 CSRF Token；
+- Session Cookie 为 HttpOnly、SameSite=Strict，HTTPS 请求额外设置 Secure；
+- 登录失败按客户端地址限速，代理头默认不受信任。
+
+Cookie 不按端口隔离，所以同一 hostname 的 8787/8788（或公网 443/8443）可以共享登录状态；浏览器 Origin 包含端口，所以两边的脚本权限仍被 SOP 分隔。网关认证 Workspace 代理请求后会剥离控制面 Session Cookie，并过滤上游同名 `Set-Cookie`，容器内服务不能读取或覆盖控制面会话。使用 HTTPS 反向代理时，两条入口必须使用相同 hostname 和不同端口，并由代理覆盖 `X-Forwarded-Proto`、`X-Forwarded-For` 后才能启用 `VIBEDOCK_TRUST_PROXY_HEADERS`。
 
 ## Agent 类型矩阵
 
@@ -372,17 +396,22 @@ vibedock-credentials:/vibedock/credentials
 
 Pi/OpenCode 不使用该卷作为账号目录，它们使用 Workspace Home 卷中的 per-Session 目录。
 
-## 统一代理
+## 分 Origin 代理
 
-所有用户入口位于同一个 Origin：
+受信任的控制工具位于控制 Origin：
 
 ```text
 /w/<workspace>/code/
 /w/<workspace>/terminal/<session>/
+```
+
+任意项目网页位于独立 Preview Origin：
+
+```text
 /w/<workspace>/port/<port>/
 ```
 
-控制面使用 Go `httputil.ReverseProxy` 转发 HTTP 和 WebSocket。Workspace 不通过随机宿主机端口暴露服务。
+两个 listener 共用 Go `httputil.ReverseProxy` 和服务端登录 Session，但入口路由互斥：控制 listener 明确拒绝 Preview 路径，Preview listener 明确拒绝 API、VS Code、Terminal 和静态控制页面。Workspace 不通过随机宿主机端口暴露服务。
 
 ### VS Code
 
@@ -398,7 +427,7 @@ Pi/OpenCode 不使用该卷作为账号目录，它们使用 Workspace Home 卷�
 
 ### Preview
 
-Preview 删除 `/w/<workspace>/port/<port>` 前缀后转发，支持 WebSocket，但不能自动修复目标应用产生的绝对 URL。
+Preview listener 删除 `/w/<workspace>/port/<port>` 前缀后转发，支持 WebSocket，但不能自动修复目标应用产生的绝对 URL。前端从受保护的 `/api/runtime-config` 读取经过校验的 Preview Origin/公网端口，并始终生成绝对跨 Origin URL；配置意外指回控制 Origin 时会禁用 Preview，而不是退化为同源代理。
 
 ## Docker 网络与卷
 
@@ -469,7 +498,9 @@ persist metadata
 - Workspace 拥有交互式终端，但镜像不安装 sudo，也不授予 `coder` 无密码提权；
 - Codex/Claude Workspace 与 auth helper 共享 Credential volume，并使用共同 UID 1001；这是可信单用户边界，不是租户隔离；
 - 原生 credential files 由登录 helper 创建、由对应 CLI 消费和刷新，不经过 VibeDock AES-GCM field encryption；
-- 控制面 Basic Auth 关闭时，任何能访问可信网络控制面的人都可能启动登录或删除本地凭据；UI 会持续显示这一边界；
+- 管理员尚未初始化时，只有持有一次性 bootstrap token 的用户可以注册；部署脚本默认只绑定回环地址，并拒绝在管理员文件不存在时绑定非回环地址；
+- 任意 Preview 内容与控制面使用不同端口 Origin，不能获得控制页面的同源脚本权限；控制 API 修改还需要 Origin 和 CSRF 校验；
+- VS Code 与 Terminal 仍位于控制 Origin；已经控制 Workspace `coder` UID 的进程可替换对应服务，所以该版本不把恶意仓库或已失陷 Workspace 当作受保护租户；
 - 同容器内 Session 使用同一 `coder` UID；
 - Docker socket 使控制面具备宿主机级能力；
 - 已获得任一 Workspace Shell 的用户可读取共享 Credential volume 中所有托管 Codex/Claude 账号文件；还可读取同一 Workspace 正在运行 Session 的 `/dev/shm` 凭据文件。当前部署模型因此只适用于完全互信的单用户或小团队。
@@ -501,6 +532,6 @@ Workspace 镜像使用受控的精确版本构建。root-owned 基线位于 `/op
 5. GitHub/GitLab OAuth 与私有仓库凭据；
 6. Snapshot / Fork / 保存为模板；
 7. 依赖缓存与预热池；
-8. 子域名 Preview；
+8. 带独立短期授权的子域名 Preview；
 9. Coder Runtime / 多节点调度；
 10. gVisor、Kata 或 microVM 隔离。
