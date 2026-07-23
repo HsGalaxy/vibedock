@@ -114,7 +114,8 @@ Pi Agent 和 OpenCode 不使用这里的 AccountProfile。它们的配置只属�
 - Linux 主机；
 - Docker Engine；
 - Docker Compose v2；
-- 建议至少 4 GB 空闲内存和 10 GB 磁盘。
+- Docker 至少分配 4 GiB 内存，检查时至少有 2 GiB 可用内存和 12 GiB 可用存储；
+- 建议 Docker 分配 8 GiB 内存，并保留 4 GiB 可用内存和 20 GiB 可用存储。
 
 运行：
 
@@ -122,6 +123,12 @@ Pi Agent 和 OpenCode 不使用这里的 AccountProfile。它们的配置只属�
 cp .env.example .env
 # 远程部署时务必设置 VIBEDOCK_ADMIN_PASSWORD
 ./scripts/bootstrap.sh
+```
+
+启动脚本会在构建前检查 Docker 守护进程实际可用的内存与存储空间。低于最低要求时会停止，达到最低要求但低于建议值时会警告。特殊环境中完成手动检查后，可以显式跳过：
+
+```bash
+VIBEDOCK_SKIP_PREFLIGHT=1 ./scripts/bootstrap.sh
 ```
 
 打开：

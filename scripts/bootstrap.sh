@@ -5,6 +5,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 command -v docker >/dev/null || { echo "Docker is required." >&2; exit 1; }
 docker compose version >/dev/null || { echo "Docker Compose v2 is required." >&2; exit 1; }
 
+./scripts/preflight.sh
+
 if [[ ! -f .env ]]; then
   cp .env.example .env
 fi

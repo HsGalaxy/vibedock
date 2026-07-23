@@ -19,4 +19,5 @@ test:
 	go test ./...
 	go vet ./...
 
-bootstrap: build-workspace build up
+bootstrap:
+	./scripts/bootstrap.sh
