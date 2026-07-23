@@ -1,0 +1,11 @@
+.git
+.git/**
+.env
+.env.*
+!.env.example
+data/**
+!data/.gitkeep
+node_modules
+server
+.research-cache
+*.log

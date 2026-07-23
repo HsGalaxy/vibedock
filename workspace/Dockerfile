@@ -1,4 +1,4 @@
-FROM node:22.23.1-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37
+FROM node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
 
 ARG TARGETARCH
 ARG CODE_SERVER_VERSION=4.129.0
@@ -61,6 +61,8 @@ RUN set -eux; \
     verify_npm_integrity @earendil-works/pi-coding-agent "$PI_VERSION" "$PI_INTEGRITY"; \
     verify_npm_integrity opencode-ai "$OPENCODE_VERSION" "$OPENCODE_INTEGRITY"
 
+# This image is Debian/glibc, so keep the glibc binaries and remove only
+# musl fallbacks that npm installs for cross-platform package support.
 RUN mkdir -p /opt/vibedock-cli \
     && npm install --prefix /opt/vibedock-cli --include=optional \
       "@openai/codex@${CODEX_VERSION}" \
@@ -68,6 +70,19 @@ RUN mkdir -p /opt/vibedock-cli \
       "opencode-ai@${OPENCODE_VERSION}" \
     && npm install --prefix /opt/vibedock-cli --ignore-scripts \
       "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+         amd64) \
+           rm -rf \
+             /opt/vibedock-cli/node_modules/@anthropic-ai/claude-code-linux-x64-musl \
+             /opt/vibedock-cli/node_modules/opencode-linux-x64-musl \
+             /opt/vibedock-cli/node_modules/opencode-linux-x64-baseline-musl ;; \
+         arm64) \
+           rm -rf \
+             /opt/vibedock-cli/node_modules/@anthropic-ai/claude-code-linux-arm64-musl \
+             /opt/vibedock-cli/node_modules/opencode-linux-arm64-musl \
+             /opt/vibedock-cli/node_modules/opencode-linux-arm64-baseline-musl ;; \
+         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
     && npm cache clean --force
 
 ENV PATH=/opt/vibedock-cli/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
