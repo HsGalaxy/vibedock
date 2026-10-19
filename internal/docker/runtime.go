@@ -88,6 +88,9 @@ func (r *Runtime) Create(ctx model.Context, req model.CreateRuntimeRequest) (mod
 		"--label", "vibedock.managed=true",
 		"--label", "vibedock.workspace_id=" + req.ID,
 		"--restart", "unless-stopped",
+		"--security-opt", "no-new-privileges",
+		"--cap-drop", "ALL",
+		"--pids-limit", "512",
 		"--memory", fmt.Sprintf("%dm", req.MemoryMB),
 		"--cpus", strconv.FormatFloat(req.CPUs, 'f', -1, 64),
 		"-v", workspaceVolume + ":/workspace",
@@ -494,6 +497,7 @@ func (r *Runtime) CaptureSession(ctx model.Context, containerName, sessionID str
 	return r.run(cctx, "exec", "-u", "coder", "-e", "HOME=/home/coder", containerName, "tmux", "capture-pane", "-p", "-J",
 		"-t", "vd-"+sessionID, "-S", "-"+strconv.Itoa(lines))
 }
+
 
 func sessionBootstrapScript(req model.SessionRuntimeRequest, restart bool) string {
 	launchCommandJSON, _ := json.Marshal(req.LaunchCommand)

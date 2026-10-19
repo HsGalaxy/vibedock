@@ -94,15 +94,31 @@ func (s *Store) Get(id string) (model.Workspace, bool) {
 func (s *Store) Put(ws model.Workspace) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.workspaces[ws.ID]
 	s.workspaces[ws.ID] = cloneWorkspace(ws)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.workspaces[ws.ID] = previous
+		} else {
+			delete(s.workspaces, ws.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.workspaces[id]
 	delete(s.workspaces, id)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.workspaces[id] = previous
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ListAccounts() []model.AccountProfile {
@@ -132,15 +148,31 @@ func (s *Store) GetAccount(id string) (model.AccountProfile, bool) {
 func (s *Store) PutAccount(account model.AccountProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.accounts[account.ID]
 	s.accounts[account.ID] = cloneAccount(account)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.accounts[account.ID] = previous
+		} else {
+			delete(s.accounts, account.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) DeleteAccount(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.accounts[id]
 	delete(s.accounts, id)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.accounts[id] = previous
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ListEnvironmentProfiles() []model.EnvironmentProfile {
@@ -169,15 +201,31 @@ func (s *Store) GetEnvironmentProfile(id string) (model.EnvironmentProfile, bool
 func (s *Store) PutEnvironmentProfile(environment model.EnvironmentProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.environments[environment.ID]
 	s.environments[environment.ID] = cloneEnvironment(environment)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.environments[environment.ID] = previous
+		} else {
+			delete(s.environments, environment.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) DeleteEnvironmentProfile(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.environments[id]
 	delete(s.environments, id)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.environments[id] = previous
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) GetSessionSecret(sessionID string) (string, bool) {
@@ -190,19 +238,35 @@ func (s *Store) GetSessionSecret(sessionID string) (string, bool) {
 func (s *Store) PutSessionSecret(sessionID, ciphertext string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.sessionSecrets[sessionID]
 	if ciphertext == "" {
 		delete(s.sessionSecrets, sessionID)
 	} else {
 		s.sessionSecrets[sessionID] = ciphertext
 	}
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.sessionSecrets[sessionID] = previous
+		} else {
+			delete(s.sessionSecrets, sessionID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) DeleteSessionSecret(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.sessionSecrets[sessionID]
 	delete(s.sessionSecrets, sessionID)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.sessionSecrets[sessionID] = previous
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) saveLocked() error {
@@ -240,14 +304,35 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".vibedock-state-*")
+	if err != nil {
+		return fmt.Errorf("create temporary state: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
 		return fmt.Errorf("write state: %w", err)
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
 		return fmt.Errorf("replace state: %w", err)
 	}
-	return nil
+	dir, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func cloneWorkspace(ws model.Workspace) model.Workspace {

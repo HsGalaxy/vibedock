@@ -14,7 +14,13 @@ export PATH="$system_path"
   /home/coder/.npm \
   /home/coder/.vibedock/sessions \
   /vibedock/credentials
-/usr/bin/chown -R coder:coder /workspace /home/coder /vibedock/credentials
+# Fix ownership only at first creation. Re-scanning an entire persisted project
+# or home on every restart is O(file count) and makes large workspaces unusable.
+for path in /workspace /home/coder /vibedock/credentials; do
+  if [[ "$(/usr/bin/stat -c %u:%g "$path")" != "1001:1001" ]]; then
+    /usr/bin/chown coder:coder "$path"
+  fi
+done
 
 if [[ ! -f /home/coder/.bashrc ]]; then
   /usr/bin/touch /home/coder/.bashrc
